@@ -21,22 +21,17 @@ const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Z
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.split('Bearer ')[1];
   if (!token) return res.status(401).json({ error: 'Brak tokenu' });
-
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return res.status(401).json({ error: 'Nieprawidłowy token' });
-
     const padding = parts[1].length % 4;
     const padded = padding ? parts[1] + '='.repeat(4 - padding) : parts[1];
     const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
-
     const now = Math.floor(Date.now() / 1000);
     if (payload.exp && payload.exp < now) {
       return res.status(401).json({ error: 'Token wygasł — zaloguj się ponownie' });
     }
-
     if (!payload.sub) return res.status(401).json({ error: 'Nieprawidłowy token' });
-
     req.user = { id: payload.sub, email: payload.email || '' };
     next();
   } catch (err) {
@@ -67,14 +62,19 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 
     const reply = data.choices[0].message.content;
 
-    supabase.from('chat_history').insert({
-      user_id: req.user.id,
-      user_message: safe[safe.length - 1]?.content,
-      ai_reply: reply,
-      model: 'llama-3.3-70b-versatile',
-    }).catch(e => console.error('History:', e.message));
+    try {
+      await supabase.from('chat_history').insert({
+        user_id: req.user.id,
+        user_message: safe[safe.length - 1]?.content,
+        ai_reply: reply,
+        model: 'llama-3.3-70b-versatile',
+      });
+    } catch(e) {
+      console.error('History error:', e.message);
+    }
 
     res.json({ reply });
+
   } catch (err) {
     res.status(502).json({ error: 'Błąd AI: ' + err.message });
   }
