@@ -36,20 +36,59 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// Wyszukiwanie przez DuckDuckGo (bezpłatne)
+// Mapa symboli kryptowalut dla CoinGecko
+const CRYPTO_MAP = {
+  bitcoin: 'bitcoin', btc: 'bitcoin',
+  ethereum: 'ethereum', eth: 'ethereum',
+  solana: 'solana', sol: 'solana',
+  cardano: 'cardano', ada: 'cardano',
+  ripple: 'ripple', xrp: 'ripple',
+  dogecoin: 'dogecoin', doge: 'dogecoin',
+  polkadot: 'polkadot', dot: 'polkadot',
+  bnb: 'binancecoin', binance: 'binancecoin',
+  usdt: 'tether', tether: 'tether',
+};
+
+// Pobierz kurs kryptowaluty z CoinGecko (bezpłatne)
+async function getCryptoPrice(query) {
+  const q = query.toLowerCase();
+  let coinId = null;
+  for (const [key, val] of Object.entries(CRYPTO_MAP)) {
+    if (q.includes(key)) { coinId = val; break; }
+  }
+  if (!coinId) return null;
+
+  try {
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true`;
+    const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const d = await r.json();
+    const coin = d[coinId];
+    if (!coin) return null;
+    const change = coin.usd_24h_change ? coin.usd_24h_change.toFixed(2) : '?';
+    const sign = parseFloat(change) >= 0 ? '+' : '';
+    return `Aktualna cena ${coinId}: ${coin.usd.toLocaleString()} USD / ${coin.pln?.toLocaleString()} PLN | Zmiana 24h: ${sign}${change}% | Market cap: ${(coin.usd_market_cap / 1e9).toFixed(1)}B USD | Źródło: CoinGecko (dane na żywo)`;
+  } catch(e) {
+    return null;
+  }
+}
+
+// Główna funkcja wyszukiwania
 async function webSearch(query) {
+  // Najpierw spróbuj kryptowaluty
+  const cryptoResult = await getCryptoPrice(query);
+  if (cryptoResult) return cryptoResult;
+
+  // Fallback — DuckDuckGo dla innych zapytań
   try {
     const url = 'https://api.duckduckgo.com/?q=' + encodeURIComponent(query) + '&format=json&no_html=1&skip_disambig=1';
     const r = await fetch(url);
     const d = await r.json();
     const result = d.AbstractText || d.Answer || (d.RelatedTopics?.[0]?.Text) || '';
     if (result) return result;
-
-    // Fallback — spróbuj Infobox
     if (d.Infobox?.content?.length > 0) {
       return d.Infobox.content.slice(0, 3).map(c => c.label + ': ' + c.value).join(', ');
     }
-    return 'Brak wyników — odpowiedz na podstawie dostępnej wiedzy.';
+    return 'Brak wyników dla: ' + query + '. Odpowiedz na podstawie dostępnej wiedzy.';
   } catch(e) {
     return 'Błąd wyszukiwania: ' + e.message;
   }
