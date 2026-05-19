@@ -131,9 +131,113 @@ async function getCryptoPrice(query) {
   } catch(e) { return null; }
 }
 
+// Alpha Vantage — akcje i surowce
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+
+// Mapa surowców i forex
+const COMMODITY_MAP = {
+  'zloto': 'XAU', 'gold': 'XAU', 'au': 'XAU',
+  'srebro': 'XAG', 'silver': 'XAG',
+  'ropa': 'WTI', 'oil': 'WTI', 'crude': 'WTI',
+  'gaz': 'NGAS', 'natural gas': 'NGAS',
+  'miedz': 'COPPER', 'copper': 'COPPER',
+  'pszenica': 'WHEAT', 'wheat': 'WHEAT',
+};
+
+// Pobierz kurs akcji z Alpha Vantage
+async function getStockPrice(symbol) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const quote = d['Global Quote'];
+    if (!quote || !quote['05. price']) return null;
+    const price = parseFloat(quote['05. price']).toFixed(2);
+    const change = parseFloat(quote['09. change']).toFixed(2);
+    const changePct = parseFloat(quote['10. change percent']).toFixed(2);
+    const volume = parseInt(quote['06. volume']).toLocaleString();
+    const sign = parseFloat(change) >= 0 ? '+' : '';
+    return `Akcje ${symbol}: $${price} | Zmiana: ${sign}${change} (${sign}${changePct}%) | Wolumen: ${volume} | Źródło: Alpha Vantage`;
+  } catch(e) { return null; }
+}
+
+// Pobierz ceny surowców z Alpha Vantage
+async function getCommodityPrice(commodity) {
+  try {
+    const url = `https://www.alphavantage.co/query?function=COMMODITY_SPOT_PRICE&symbol=${commodity}&apikey=${AV_KEY}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.data && d.data.length > 0) {
+      const latest = d.data[0];
+      const prev = d.data[1];
+      const price = parseFloat(latest.value).toFixed(2);
+      const prevPrice = parseFloat(prev?.value || latest.value).toFixed(2);
+      const change = (parseFloat(latest.value) - parseFloat(prev?.value || latest.value)).toFixed(2);
+      const sign = parseFloat(change) >= 0 ? '+' : '';
+      return `${commodity} (spot): $${price} | Zmiana: ${sign}${change} | Data: ${latest.date} | Źródło: Alpha Vantage`;
+    }
+    return null;
+  } catch(e) { return null; }
+}
+
+// Fear & Greed Index
+async function getFearGreed() {
+  try {
+    const r = await fetch('https://api.alternative.me/fng/?limit=1');
+    const d = await r.json();
+    const fg = d.data[0];
+    return `Fear & Greed Index: ${fg.value}/100 (${fg.value_classification}) | Źródło: Alternative.me`;
+  } catch(e) { return null; }
+}
+
+// Wykryj symbol akcji w zapytaniu (np. AAPL, TSLA, XTB, PKN)
+function detectStockSymbol(query) {
+  const q = query.toUpperCase();
+  // Znane polskie i zagraniczne spółki
+  const KNOWN = {
+    'APPLE': 'AAPL', 'TESLA': 'TSLA', 'MICROSOFT': 'MSFT', 'GOOGLE': 'GOOGL',
+    'AMAZON': 'AMZN', 'META': 'META', 'NVIDIA': 'NVDA', 'NETFLIX': 'NFLX',
+    'XTB': 'XTB.WA', 'PKN': 'PKN.WA', 'ORLEN': 'PKN.WA', 'KGHM': 'KGH.WA',
+    'PKO': 'PKO.WA', 'PEKAO': 'PEO.WA', 'CD PROJEKT': 'CDR.WA', 'CDPR': 'CDR.WA',
+    'LPP': 'LPP.WA', 'ALLEGRO': 'ALE.WA', 'DINO': 'DNP.WA',
+  };
+  for (const [name, symbol] of Object.entries(KNOWN)) {
+    if (q.includes(name)) return symbol;
+  }
+  // Wykryj ticker (2-5 wielkich liter)
+  const match = query.match(/\b([A-Z]{2,5})\b/);
+  if (match) return match[1];
+  return null;
+}
+
 async function webSearch(query) {
+  // 1. Kryptowaluty
   const crypto = await getCryptoPrice(query);
   if (crypto) return crypto;
+
+  // 2. Fear & Greed jeśli pytanie o sentyment
+  const q = query.toLowerCase();
+  if (q.includes('fear') || q.includes('greed') || q.includes('strach') || q.includes('sentyment')) {
+    const fg = await getFearGreed();
+    if (fg) return fg;
+  }
+
+  // 3. Surowce
+  for (const [keyword, symbol] of Object.entries(COMMODITY_MAP)) {
+    if (q.includes(keyword)) {
+      const result = await getCommodityPrice(symbol);
+      if (result) return result;
+    }
+  }
+
+  // 4. Akcje
+  const stockSymbol = detectStockSymbol(query);
+  if (stockSymbol) {
+    const result = await getStockPrice(stockSymbol);
+    if (result) return result;
+  }
+
+  // 5. Fallback — DuckDuckGo
   try {
     const r = await fetch('https://api.duckduckgo.com/?q=' + encodeURIComponent(query) + '&format=json&no_html=1&skip_disambig=1');
     const d = await r.json();
@@ -142,10 +246,22 @@ async function webSearch(query) {
 }
 
 // ── AI Chat ─────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Jesteś ekspertowym asystentem analiz finansowych z dostępem do aktualnych danych.
-Specjalizujesz się w: DCF, LBO, Comparable Company Analysis, Equity Research, Investment Banking, Private Equity, KYC i M&A.
-Gdy pytanie dotyczy aktualnych kursów lub cen — użyj web_search.
-Odpowiadaj po polsku. Przy obliczeniach pokazuj wzory. Analizy nie stanowią porady inwestycyjnej.`;
+const SYSTEM_PROMPT = `Jesteś eksperckim asystentem analiz finansowych i kryptowalutowych. Zawsze dajesz KONKRETNE odpowiedzi z liczbami i przedziałami cenowymi.
+
+ZASADY ODPOWIEDZI:
+1. Nigdy nie odmawiaj analizy — zawsze podaj konkretne poziomy cenowe i wnioski
+2. Dla kryptowalut zawsze analizuj z TRZECH perspektyw:
+   - ANALIZA TECHNICZNA: wsparcia, opory, RSI, średnie kroczące MA50/MA200, wzorce świecowe
+   - ANALIZA FUNDAMENTALNA: adopcja, regulacje, makroekonomia, cykl halvingowy, konkurencja
+   - ANALIZA ON-CHAIN: aktywne adresy, przepływy na giełdy, wskaźnik MVRV, NVT ratio, HODLerzy
+3. Podawaj KONKRETNE przedziały cenowe np. "wsparcie: $45,000-$48,000", "cel: $95,000"
+4. Używaj danych historycznych jako punktu odniesienia
+5. Bądź odważny w prognozach — to jest analiza, nie gwarancja
+6. Na końcu dodaj jedno zdanie zastrzeżenia
+
+Specjalizujesz się w: DCF, LBO, Comps, Equity Research, IB, Private Equity, KYC, M&A, kryptowaluty, akcje, forex.
+Gdy pytanie dotyczy aktualnych kursów — użyj web_search.
+Odpowiadaj po polsku. Przy obliczeniach pokazuj wzory i liczby.`;
 
 const WEB_SEARCH_TOOL = [{ type: 'function', function: { name: 'web_search', description: 'Wyszukaj aktualne informacje finansowe', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } }];
 
