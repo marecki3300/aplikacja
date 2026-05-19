@@ -1,8 +1,8 @@
 {
   "name": "finai-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "FinAI Backend — Node.js + Express + Supabase + Groq",
+  "description": "FinAI Backend — Node.js + Express + Supabase + Groq + Stripe",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,8 @@
     "cors": "^2.8.5",
     "node-fetch": "^3.3.2",
     "@supabase/supabase-js": "^2.39.0",
-    "express-rate-limit": "^7.1.5"
+    "express-rate-limit": "^7.1.5",
+    "stripe": "^14.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
