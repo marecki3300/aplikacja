@@ -1,6 +1,10 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" }
+    { "source": "/api/chat", "destination": "/api/chat" },
+    { "source": "/api/health", "destination": "/api/health" },
+    { "source": "/api/history", "destination": "/api/history" },
+    { "source": "/api/profile", "destination": "/api/profile" },
+    { "source": "/api/create-checkout", "destination": "/api/create-checkout" }
   ]
 }
