@@ -65,14 +65,26 @@ async function incrementCount(userId) {
 async function fetchCrypto(coins) {
   try {
     const ids = coins.join(',');
-    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`);
+    const r = await fetch(
+      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`,
+      { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
+    );
+    if (!r.ok) throw new Error(`CoinGecko status: ${r.status}`);
     const d = await r.json();
+    console.log('CoinGecko raw:', JSON.stringify(d).slice(0, 300));
+    
     return Object.entries(d).map(([id, data]) => {
-      const change = data.usd_24h_change?.toFixed(2) || '?';
+      const price = data['usd'];
+      const change = data['usd_24h_change']?.toFixed(2) || '?';
+      const mcap = data['usd_market_cap'];
+      const vol = data['usd_24h_vol'];
       const sign = parseFloat(change) >= 0 ? '+' : '';
-      return `${id.toUpperCase()}: $${data.usd?.toLocaleString()} (${sign}${change}% 24h) | MCap: $${(data.usd_market_cap/1e9).toFixed(1)}B | Vol24h: $${(data.usd_24h_vol/1e6).toFixed(0)}M`;
+      return `${id.toUpperCase()}: $${price?.toLocaleString()} (${sign}${change}% 24h) | MCap: $${(mcap/1e9).toFixed(1)}B | Vol24h: $${(vol/1e6).toFixed(0)}M`;
     }).join('\n');
-  } catch(e) { return null; }
+  } catch(e) {
+    console.error('CoinGecko error:', e.message);
+    return null;
+  }
 }
 
 // 2. Metale szlachetne — metals.live
