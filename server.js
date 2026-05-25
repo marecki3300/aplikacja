@@ -38,7 +38,7 @@ async function requireAuth(req, res, next) {
 }
 
 // ── PLAN CHECK ──────────────────────────────────────────────
-const FREE_LIMIT = 5;
+const FREE_LIMIT = 50;
 
 async function checkPlan(req, res, next) {
   const { data: profile } = await supabase.from('profiles').select('plan, queries_today, last_query_date').eq('id', req.user.id).single();
