@@ -231,7 +231,7 @@ app.post('/api/chat', requireAuth, checkPlan, aiLimiter, async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'deepseek-r1-distill-llama-70b',
+        model: 'deepseek-r1-distill-llama-70b-specdec',
         max_tokens: 2000,
         messages: [{ role: 'system', content: systemPrompt }, ...safe],
         temperature: 0.6,
