@@ -231,7 +231,7 @@ app.post('/api/chat', requireAuth, checkPlan, aiLimiter, async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'deepseek-r1-distill-llama-70b',
+        model: 'llama-3.3-70b-versatile',
         max_tokens: 2000,
         messages: [{ role: 'system', content: systemPrompt }, ...safe],
         temperature: 0.6,
@@ -252,7 +252,7 @@ app.post('/api/chat', requireAuth, checkPlan, aiLimiter, async (req, res) => {
         user_id: req.user.id,
         user_message: lastUserMsg,
         ai_reply: reply,
-        model: 'deepseek-r1-distill-llama-70b',
+        model: 'llama-3.3-70b-versatile',
       });
       await incrementCount(req.user.id);
     } catch(e) { console.error('DB:', e.message); }
@@ -385,6 +385,6 @@ app.get('/api/chart/:symbol', requireAuth, async (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
-app.get('/health', (_, res) => res.json({ status: 'ok', model: 'deepseek-r1-distill-llama-70b', rag: true }));
+app.get('/health', (_, res) => res.json({ status: 'ok', model: 'llama-3.3-70b-versatile', rag: true }));
 
 app.listen(PORT, () => console.log('FinAI v3 (DeepSeek R1 + RAG) na porcie ' + PORT));
