@@ -38,7 +38,7 @@ async function requireAuth(req, res, next) {
 }
 
 // ── PLAN CHECK ──────────────────────────────────────────────
-const FREE_LIMIT = 50;
+const FREE_LIMIT = 5;
 
 async function checkPlan(req, res, next) {
   const { data: profile } = await supabase.from('profiles').select('plan, queries_today, last_query_date').eq('id', req.user.id).single();
@@ -65,26 +65,14 @@ async function incrementCount(userId) {
 async function fetchCrypto(coins) {
   try {
     const ids = coins.join(',');
-    const r = await fetch(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`,
-      { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
-    );
-    if (!r.ok) throw new Error(`CoinGecko status: ${r.status}`);
+    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`);
     const d = await r.json();
-    console.log('CoinGecko raw:', JSON.stringify(d).slice(0, 300));
-    
     return Object.entries(d).map(([id, data]) => {
-      const price = data['usd'];
-      const change = data['usd_24h_change']?.toFixed(2) || '?';
-      const mcap = data['usd_market_cap'];
-      const vol = data['usd_24h_vol'];
+      const change = data.usd_24h_change?.toFixed(2) || '?';
       const sign = parseFloat(change) >= 0 ? '+' : '';
-      return `${id.toUpperCase()}: $${price?.toLocaleString()} (${sign}${change}% 24h) | MCap: $${(mcap/1e9).toFixed(1)}B | Vol24h: $${(vol/1e6).toFixed(0)}M`;
+      return `${id.toUpperCase()}: $${data.usd?.toLocaleString()} (${sign}${change}% 24h) | MCap: $${(data.usd_market_cap/1e9).toFixed(1)}B | Vol24h: $${(data.usd_24h_vol/1e6).toFixed(0)}M`;
     }).join('\n');
-  } catch(e) {
-    console.error('CoinGecko error:', e.message);
-    return null;
-  }
+  } catch(e) { return null; }
 }
 
 // 2. Metale szlachetne — metals.live
@@ -243,7 +231,7 @@ app.post('/api/chat', requireAuth, checkPlan, aiLimiter, async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: 'deepseek-r1-distill-llama-70b',
         max_tokens: 2000,
         messages: [{ role: 'system', content: systemPrompt }, ...safe],
         temperature: 0.6,
@@ -327,6 +315,73 @@ app.get('/api/history', requireAuth, async (req, res) => {
   const { data, error } = await supabase.from('chat_history').select('id, user_message, ai_reply, created_at').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(50);
   if (error) return res.status(500).json({ error: 'Błąd bazy' });
   res.json({ history: data || [] });
+});
+
+
+// ── GET /api/chart/:symbol ───────────────────────────────────
+app.get('/api/chart/:symbol', requireAuth, async (req, res) => {
+  const symbol = req.params.symbol.toLowerCase();
+  const days   = parseInt(req.query.days) || 30;
+  const type   = req.query.type || 'crypto';
+
+  try {
+    if (type === 'crypto') {
+      const r = await fetch(
+        `https://api.coingecko.com/api/v3/coins/${symbol}/market_chart?vs_currency=usd&days=${days}`,
+        { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
+      );
+      if (!r.ok) return res.status(404).json({ error: `Nie znaleziono krypto: ${symbol}` });
+      const d = await r.json();
+
+      const prices  = (d.prices || []).map(p => ({ t: p[0], v: p[1] }));
+      const volumes = (d.total_volumes || []).map(p => ({ t: p[0], v: p[1] }));
+
+      const infoR = await fetch(
+        `https://api.coingecko.com/api/v3/simple/price?ids=${symbol}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`,
+        { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
+      );
+      const info = await infoR.json();
+      const meta = info[symbol] || {};
+
+      return res.json({
+        symbol, type: 'crypto', days, prices, volumes,
+        meta: {
+          price:     meta.usd,
+          change24h: meta.usd_24h_change,
+          marketCap: meta.usd_market_cap,
+          vol24h:    meta.usd_24h_vol,
+        }
+      });
+
+    } else {
+      const size = days <= 90 ? 'compact' : 'full';
+      const r = await fetch(
+        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${symbol.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
+      );
+      const d = await r.json();
+      const ts = d['Time Series (Daily)'];
+      if (!ts) return res.status(404).json({ error: `Nie znaleziono akcji: ${symbol}` });
+
+      const entries = Object.entries(ts)
+        .sort((a, b) => a[0] < b[0] ? -1 : 1)
+        .slice(-days);
+
+      const prices  = entries.map(([date, v]) => ({ t: new Date(date).getTime(), v: parseFloat(v['4. close']) }));
+      const volumes = entries.map(([date, v]) => ({ t: new Date(date).getTime(), v: parseFloat(v['5. volume']) }));
+
+      const last   = prices[prices.length - 1]?.v;
+      const prev   = prices[prices.length - 2]?.v || last;
+      const change = prev ? ((last - prev) / prev * 100) : 0;
+
+      return res.json({
+        symbol: symbol.toUpperCase(), type: 'stock', days, prices, volumes,
+        meta: { price: last, change24h: change, marketCap: null, vol24h: null }
+      });
+    }
+
+  } catch (err) {
+    res.status(502).json({ error: 'Błąd pobierania danych: ' + err.message });
+  }
 });
 
 app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
