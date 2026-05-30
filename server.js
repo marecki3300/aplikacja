@@ -61,11 +61,27 @@ async function incrementCount(userId) {
 // RAG — POBIERANIE DANYCH NA ŻYWO
 // ══════════════════════════════════════════════════════════════
 
-// 1. Kryptowaluty — CoinGecko
+// 1. Kryptowaluty — CoinGecko z retry
+async function fetchWithRetry(url, options, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url, options);
+      if (r.status === 429) {
+        await new Promise(res => setTimeout(res, 2000 * (i + 1)));
+        continue;
+      }
+      return r;
+    } catch(e) {
+      if (i === retries - 1) throw e;
+      await new Promise(res => setTimeout(res, 1000 * (i + 1)));
+    }
+  }
+}
+
 async function fetchCrypto(coins) {
   try {
     const ids = coins.join(',');
-    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`);
+    const r = await fetchWithRetry(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`, { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } });
     const d = await r.json();
     return Object.entries(d).map(([id, data]) => {
       const change = data.usd_24h_change?.toFixed(2) || '?';
