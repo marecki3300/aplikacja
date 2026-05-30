@@ -326,11 +326,22 @@ app.get('/api/chart/:symbol', requireAuth, async (req, res) => {
 
   try {
     if (type === 'crypto') {
-      const r = await fetch(
-        `https://api.coingecko.com/api/v3/coins/${symbol}/market_chart?vs_currency=usd&days=${days}`,
-        { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
-      );
-      if (!r.ok) return res.status(404).json({ error: `Nie znaleziono krypto: ${symbol}` });
+      // Spróbuj CoinGecko z retry
+      let r;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        r = await fetch(
+          `https://api.coingecko.com/api/v3/coins/${symbol}/market_chart?vs_currency=usd&days=${days}&interval=${days <= 1 ? 'minutely' : days <= 7 ? 'hourly' : 'daily'}`,
+          { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
+        );
+        if (r.status !== 429) break;
+        console.log('CoinGecko rate limit, retry', attempt + 1);
+        await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
+      }
+      if (!r.ok) {
+        const errText = await r.text();
+        console.error('CoinGecko error:', r.status, errText.slice(0, 200));
+        return res.status(404).json({ error: `CoinGecko błąd ${r.status}: ${symbol}` });
+      }
       const d = await r.json();
 
       const prices  = (d.prices || []).map(p => ({ t: p[0], v: p[1] }));
