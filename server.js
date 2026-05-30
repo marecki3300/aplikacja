@@ -387,4 +387,16 @@ app.get('/api/chart/:symbol', requireAuth, async (req, res) => {
 app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
 app.get('/health', (_, res) => res.json({ status: 'ok', model: 'llama-3.3-70b-versatile', rag: true }));
 
+
+// ── Keep-alive — pinguje siebie co 14 minut żeby Render nie zasnął ──────────
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
+setInterval(async () => {
+  try {
+    const r = await fetch(SELF_URL + '/health');
+    console.log('Keep-alive ping:', r.status);
+  } catch(e) {
+    console.log('Keep-alive failed:', e.message);
+  }
+}, 14 * 60 * 1000); // co 14 minut
+
 app.listen(PORT, () => console.log('FinAI v3 (DeepSeek R1 + RAG) na porcie ' + PORT));
