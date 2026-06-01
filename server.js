@@ -1,325 +1,382 @@
-// FinAI Backend v3 — DeepSeek R1 + RAG + Live Data
+// FinAI v2 — Backend
+// Stack: Express + Groq (Llama) + Binance + Supabase + Stripe
+// Deploy: Render.com
+
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
-import rateLimit from 'express-rate-limit';
 import Stripe from 'stripe';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+// ── Clients ──────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'] }));
+// ── Middleware ────────────────────────────────────────────────
+app.use(cors({ origin: '*' }));
 app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '50kb' }));
-const aiLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Za dużo zapytań.' } });
 
-// ── AUTH ────────────────────────────────────────────────────
-async function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.split('Bearer ')[1];
-  if (!token) return res.status(401).json({ error: 'Brak tokenu' });
-  try {
-    const parts = token.split('.');
-    const padding = parts[1].length % 4;
-    const padded = padding ? parts[1] + '='.repeat(4 - padding) : parts[1];
-    const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && payload.exp < now) return res.status(401).json({ error: 'Token wygasł' });
-    if (!payload.sub) return res.status(401).json({ error: 'Nieprawidłowy token' });
-    req.user = { id: payload.sub, email: payload.email || '' };
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Błąd tokenu: ' + err.message });
-  }
+// ── Auth ──────────────────────────────────────────────────────
+function decodeToken(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token');
+  const pad = parts[1].length % 4;
+  const padded = pad ? parts[1] + '='.repeat(4 - pad) : parts[1];
+  const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) throw new Error('Token expired');
+  if (!payload.sub) throw new Error('No user');
+  return { id: payload.sub, email: payload.email || '' };
 }
 
-// ── PLAN CHECK ──────────────────────────────────────────────
+function auth(req, res, next) {
+  const token = req.headers.authorization?.split('Bearer ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try { req.user = decodeToken(token); next(); }
+  catch(e) { res.status(401).json({ error: e.message }); }
+}
+
+// ── Plan check ────────────────────────────────────────────────
 const FREE_LIMIT = 5;
 
 async function checkPlan(req, res, next) {
-  const { data: profile } = await supabase.from('profiles').select('plan, queries_today, last_query_date').eq('id', req.user.id).single();
+  const { data } = await supabase
+    .from('profiles')
+    .select('plan, queries_today, last_query_date')
+    .eq('id', req.user.id)
+    .single();
+
   const today = new Date().toISOString().slice(0, 10);
-  let queries = profile?.last_query_date?.slice(0, 10) === today ? (profile.queries_today || 0) : 0;
-  req.userPlan = profile?.plan || 'free';
-  req.queriesToday = queries;
-  if (req.userPlan === 'free' && queries >= FREE_LIMIT) {
-    return res.status(403).json({ error: 'Przekroczono limit 5 zapytań/dzień.', upgrade: true, plan: 'free' });
+  const queries = data?.last_query_date?.slice(0, 10) === today ? (data.queries_today || 0) : 0;
+  req.plan = data?.plan || 'free';
+  req.queries = queries;
+
+  if (req.plan === 'free' && queries >= FREE_LIMIT) {
+    return res.status(403).json({ error: 'Daily limit reached', upgrade: true, plan: 'free' });
   }
   next();
 }
 
-async function incrementCount(userId) {
+async function incQueries(userId) {
   const today = new Date().toISOString().slice(0, 10);
   try { await supabase.rpc('increment_queries', { user_id: userId, today }); } catch(e) {}
 }
 
 // ══════════════════════════════════════════════════════════════
-// RAG — POBIERANIE DANYCH NA ŻYWO
+// MARKET DATA — Binance (szybkie, bez limitu)
 // ══════════════════════════════════════════════════════════════
 
-// 1. Kryptowaluty — CoinGecko z retry
-async function fetchWithRetry(url, options, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const r = await fetch(url, options);
-      if (r.status === 429) {
-        await new Promise(res => setTimeout(res, 2000 * (i + 1)));
-        continue;
-      }
-      return r;
-    } catch(e) {
-      if (i === retries - 1) throw e;
-      await new Promise(res => setTimeout(res, 1000 * (i + 1)));
-    }
-  }
+// Cache 60 sekund
+const cache = new Map();
+function cached(key, ttl, fn) {
+  const now = Date.now();
+  const hit = cache.get(key);
+  if (hit && now - hit.ts < ttl) return Promise.resolve(hit.data);
+  return fn().then(data => { cache.set(key, { data, ts: now }); return data; });
 }
 
-async function fetchCrypto(coins) {
-  try {
-    const ids = coins.join(',');
-    const r = await fetchWithRetry(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,pln&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`, { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } });
+// Binance ticker — cena + zmiana 24h
+async function getBinanceTicker(symbol) {
+  return cached(`ticker:${symbol}`, 30000, async () => {
+    const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
+    if (!r.ok) return null;
     const d = await r.json();
-    return Object.entries(d).map(([id, data]) => {
-      const change = data.usd_24h_change?.toFixed(2) || '?';
-      const sign = parseFloat(change) >= 0 ? '+' : '';
-      return `${id.toUpperCase()}: $${data.usd?.toLocaleString()} (${sign}${change}% 24h) | MCap: $${(data.usd_market_cap/1e9).toFixed(1)}B | Vol24h: $${(data.usd_24h_vol/1e6).toFixed(0)}M`;
-    }).join('\n');
-  } catch(e) { return null; }
+    return {
+      price: parseFloat(d.lastPrice),
+      change24h: parseFloat(d.priceChangePercent),
+      volume24h: parseFloat(d.quoteVolume),
+      high24h: parseFloat(d.highPrice),
+      low24h: parseFloat(d.lowPrice),
+    };
+  });
 }
 
-// 2. Metale szlachetne — metals.live
-async function fetchMetals() {
-  try {
-    const r = await fetch('https://metals.live/api/v1/spot');
+// Binance klines — dane do wykresu
+async function getBinanceChart(symbol, interval, limit) {
+  return cached(`chart:${symbol}:${interval}:${limit}`, 60000, async () => {
+    const r = await fetch(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+    );
+    if (!r.ok) return null;
     const d = await r.json();
-    const metals = Array.isArray(d) ? d : [];
-    return metals.slice(0, 4).map(m => `${m.name || m.symbol}: $${parseFloat(m.price || m.ask || 0).toFixed(2)}/oz`).join(' | ');
-  } catch(e) { return null; }
+    return d.map(k => ({
+      t: k[0],           // timestamp
+      o: parseFloat(k[1]), // open
+      h: parseFloat(k[2]), // high
+      l: parseFloat(k[3]), // low
+      c: parseFloat(k[4]), // close
+      v: parseFloat(k[5]), // volume
+    }));
+  });
 }
 
-// 3. Akcje — Alpha Vantage
-async function fetchStock(symbol) {
-  try {
-    const r = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`);
+// Fear & Greed
+async function getFearGreed() {
+  return cached('fear_greed', 300000, async () => {
+    const r = await fetch('https://api.alternative.me/fng/?limit=1');
+    const d = await r.json();
+    return d.data[0];
+  });
+}
+
+// Alpha Vantage — akcje
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+async function getStockData(symbol) {
+  return cached(`stock:${symbol}`, 300000, async () => {
+    const r = await fetch(
+      `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+    );
     const d = await r.json();
     const q = d['Global Quote'];
     if (!q || !q['05. price']) return null;
-    const price = parseFloat(q['05. price']).toFixed(2);
-    const change = parseFloat(q['09. change']).toFixed(2);
-    const pct = q['10. change percent']?.replace('%','').trim();
-    const sign = parseFloat(change) >= 0 ? '+' : '';
-    return `${symbol}: $${price} (${sign}${change}, ${sign}${parseFloat(pct).toFixed(2)}%) | Vol: ${parseInt(q['06. volume']).toLocaleString()}`;
-  } catch(e) { return null; }
+    return {
+      price: parseFloat(q['05. price']),
+      change24h: parseFloat(q['10. change percent']),
+      volume24h: parseFloat(q['06. volume']),
+    };
+  });
 }
 
-// 4. Fear & Greed Index
-async function fetchFearGreed() {
-  try {
-    const r = await fetch('https://api.alternative.me/fng/?limit=3');
-    const d = await r.json();
-    return d.data.map(fg => `${fg.timestamp ? new Date(fg.timestamp*1000).toLocaleDateString('pl-PL') : 'dziś'}: ${fg.value}/100 (${fg.value_classification})`).join(', ');
-  } catch(e) { return null; }
-}
+// Mapa symboli Binance
+const BINANCE_SYMBOLS = {
+  'bitcoin': 'BTCUSDT', 'btc': 'BTCUSDT',
+  'ethereum': 'ETHUSDT', 'eth': 'ETHUSDT',
+  'solana': 'SOLUSDT', 'sol': 'SOLUSDT',
+  'ripple': 'XRPUSDT', 'xrp': 'XRPUSDT',
+  'binancecoin': 'BNBUSDT', 'bnb': 'BNBUSDT',
+  'cardano': 'ADAUSDT', 'ada': 'ADAUSDT',
+  'dogecoin': 'DOGEUSDT', 'doge': 'DOGEUSDT',
+  'polkadot': 'DOTUSDT', 'dot': 'DOTUSDT',
+  'avalanche': 'AVAXUSDT', 'avax': 'AVAXUSDT',
+  'chainlink': 'LINKUSDT', 'link': 'LINKUSDT',
+};
 
-// 5. Forex — exchangerate.host
-async function fetchForex(pairs) {
-  try {
-    const r = await fetch(`https://api.exchangerate.host/latest?base=USD&symbols=${pairs.join(',')}`);
-    const d = await r.json();
-    if (!d.rates) return null;
-    return pairs.map(p => `USD/${p}: ${d.rates[p]?.toFixed(4)}`).join(' | ');
-  } catch(e) { return null; }
-}
-
-// ── GŁÓWNA FUNKCJA RAG ──────────────────────────────────────
-// Analizuje pytanie i zbiera tylko potrzebne dane
-async function buildContext(userMessage) {
-  const msg = userMessage.toLowerCase();
-  const parts = [];
-  const timestamp = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
-  parts.push(`AKTUALNA DATA I CZAS: ${timestamp}`);
-
+// ── RAG — buduj kontekst dla AI ───────────────────────────────
+async function buildContext(message) {
+  const msg = message.toLowerCase();
+  const parts = [`TIME: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
 
-  // Kryptowaluty
-  const cryptoMap = {
-    'bitcoin|btc': 'bitcoin', 'ethereum|eth': 'ethereum',
-    'solana|sol': 'solana', 'bnb|binance': 'binancecoin',
-    'xrp|ripple': 'ripple', 'cardano|ada': 'cardano',
-    'dogecoin|doge': 'dogecoin', 'polkadot|dot': 'polkadot',
-    'avalanche|avax': 'avalanche-2', 'chainlink|link': 'chainlink',
+  // Krypto przez Binance
+  const cryptoKeywords = {
+    'bitcoin|btc': 'BTCUSDT',
+    'ethereum|eth': 'ETHUSDT',
+    'solana|sol': 'SOLUSDT',
+    'xrp|ripple': 'XRPUSDT',
+    'bnb|binance coin': 'BNBUSDT',
+    'cardano|ada': 'ADAUSDT',
+    'dogecoin|doge': 'DOGEUSDT',
+    'avax|avalanche': 'AVAXUSDT',
   };
 
-  const coinsToFetch = [];
-  for (const [keywords, coinId] of Object.entries(cryptoMap)) {
-    if (keywords.split('|').some(k => msg.includes(k))) coinsToFetch.push(coinId);
-  }
-
-  // Jeśli pytanie ogólne o krypto — pobierz top 5
-  if (msg.includes('krypto') || msg.includes('crypto') || msg.includes('rynek') || coinsToFetch.length === 0 && (msg.includes('analiz') || msg.includes('cen'))) {
-    if (coinsToFetch.length === 0) coinsToFetch.push('bitcoin', 'ethereum', 'solana', 'binancecoin', 'ripple');
-  }
-
-  if (coinsToFetch.length > 0) {
-    promises.push(fetchCrypto(coinsToFetch).then(d => d && parts.push('KRYPTOWALUTY (na żywo):\n' + d)));
-  }
-
-  // Fear & Greed — zawsze dla krypto
-  if (coinsToFetch.length > 0 || msg.includes('sentyment') || msg.includes('fear') || msg.includes('strach')) {
-    promises.push(fetchFearGreed().then(d => d && parts.push('FEAR & GREED INDEX (ostatnie 3 dni): ' + d)));
-  }
-
-  // Metale
-  if (['zloto', 'złoto', 'gold', 'srebro', 'silver', 'platyna', 'metal', 'surowiec'].some(k => msg.includes(k))) {
-    promises.push(fetchMetals().then(d => d && parts.push('METALE SZLACHETNE (na żywo): ' + d)));
-  }
-
-  // Akcje polskie i zagraniczne
-  const stockMap = {
-    'apple|aapl': 'AAPL', 'tesla|tsla': 'TSLA', 'microsoft|msft': 'MSFT',
-    'nvidia|nvda': 'NVDA', 'google|googl|alphabet': 'GOOGL', 'amazon|amzn': 'AMZN',
-    'meta': 'META', 'netflix|nflx': 'NFLX', 'xtb': 'XTB.WA',
-    'orlen|pkn': 'PKN.WA', 'kghm|kgh': 'KGH.WA', 'pko': 'PKO.WA',
-    'cd projekt|cdpr|cdr': 'CDR.WA', 'allegro|ale': 'ALE.WA', 'lpp': 'LPP.WA',
-  };
-
-  for (const [keywords, symbol] of Object.entries(stockMap)) {
-    if (keywords.split('|').some(k => msg.includes(k))) {
-      promises.push(fetchStock(symbol).then(d => d && parts.push(`AKCJE ${symbol} (na żywo): ${d}`)));
+  for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      promises.push(
+        getBinanceTicker(binSym).then(d => d &&
+          parts.push(`${binSym}: $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% | Vol: $${(d.volume24h/1e6).toFixed(0)}M | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [Binance]`)
+        )
+      );
     }
   }
 
-  // Forex
-  if (['dolar', 'euro', 'frank', 'funt', 'forex', 'walut', 'kurs usd', 'kurs eur', 'pln'].some(k => msg.includes(k))) {
-    promises.push(fetchForex(['PLN', 'EUR', 'GBP', 'CHF', 'JPY']).then(d => d && parts.push('FOREX USD (na żywo): ' + d)));
+  // Fear & Greed dla krypto
+  if (Object.keys(cryptoKeywords).some(k => k.split('|').some(w => msg.includes(w))) ||
+      msg.includes('krypto') || msg.includes('crypto') || msg.includes('sentyment')) {
+    promises.push(
+      getFearGreed().then(d => d &&
+        parts.push(`Fear & Greed Index: ${d.value}/100 (${d.value_classification})`)
+      )
+    );
+  }
+
+  // Akcje
+  const stockKeywords = {
+    'apple|aapl': 'AAPL', 'tesla|tsla': 'TSLA',
+    'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
+    'google|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
+    'meta': 'META', 'netflix|nflx': 'NFLX',
+    'xtb': 'XTB.WA', 'orlen|pkn': 'PKN.WA',
+    'kghm': 'KGH.WA', 'cd projekt|cdpr': 'CDR.WA',
+  };
+
+  for (const [keys, sym] of Object.entries(stockKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      promises.push(
+        getStockData(sym).then(d => d &&
+          parts.push(`${sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h.toFixed(2)}% [Alpha Vantage]`)
+        )
+      );
+    }
   }
 
   await Promise.all(promises);
-
-  return parts.length > 1 ? parts.join('\n\n') : null;
+  return parts.length > 1 ? parts.join('\n') : null;
 }
 
-// ══════════════════════════════════════════════════════════════
-// SYSTEM PROMPT
-// ══════════════════════════════════════════════════════════════
-const BASE_SYSTEM = `Jesteś eksperckim asystentem analiz finansowych. Zawsze dajesz KONKRETNE odpowiedzi z liczbami.
+// ── System prompt ─────────────────────────────────────────────
+const SYSTEM = `Jesteś eksperckim asystentem analiz finansowych z dostępem do danych rynkowych na żywo.
 
 ZASADY:
-1. Gdy otrzymujesz dane rynkowe w kontekście — UŻYWAJ ICH jako podstawy analizy
-2. Dla kryptowalut analizuj z 3 perspektyw: TECHNICZNA, FUNDAMENTALNA, ON-CHAIN
-3. Podawaj konkretne poziomy: "wsparcie $X, opór $Y, cel $Z"
-4. Bądź odważny w prognozach — to analiza, nie gwarancja
-5. Używaj danych historycznych + aktualne dane z kontekstu
-6. Na końcu jedno zdanie zastrzeżenia
+1. Gdy masz dane rynkowe w kontekście — UŻYWAJ ICH jako podstawy analizy
+2. Dla kryptowalut: ANALIZA TECHNICZNA (wsparcia, opory, RSI, trend) + FUNDAMENTALNA + ON-CHAIN
+3. Podawaj KONKRETNE poziomy cenowe: "wsparcie $X, opór $Y, cel $Z"
+4. Bądź konkretny i odważny w prognozach
+5. Krótkie zastrzeżenie na końcu
 
-Specjalizujesz się w: DCF, LBO, Equity Research, IB, Private Equity, KYC, M&A, kryptowaluty, akcje, forex, surowce.
-Odpowiadaj po polsku. Przy obliczeniach pokazuj wzory.`;
+Specjalizacje: DCF, LBO, Equity Research, IB, PE, KYC, M&A, krypto, akcje, forex.
+Odpowiadaj po polsku.`;
 
-// ── POST /api/chat ───────────────────────────────────────────
-app.post('/api/chat', requireAuth, checkPlan, aiLimiter, async (req, res) => {
+// ── POST /api/chat ────────────────────────────────────────────
+app.post('/api/chat', auth, checkPlan, async (req, res) => {
   const { messages } = req.body;
-  if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: 'Brak wiadomości' });
+  if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'No messages' });
 
   const safe = messages
     .filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
     .slice(-10)
     .map(m => ({ role: m.role, content: m.content.slice(0, 3000) }));
 
-  const lastUserMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
+  const lastMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
+  const context = await buildContext(lastMsg);
+  const systemPrompt = context
+    ? `${SYSTEM}\n\n=== DANE RYNKOWE (na żywo) ===\n${context}\n===========================`
+    : SYSTEM;
 
   try {
-    // RAG — pobierz dane na żywo równolegle z budowaniem odpowiedzi
-    const contextData = await buildContext(lastUserMsg);
-
-    // Zbuduj system prompt z danymi
-    const systemPrompt = contextData
-      ? BASE_SYSTEM + '\n\n═══ AKTUALNE DANE RYNKOWE (pobrane na żywo) ═══\n' + contextData + '\n═══════════════════════════════════════════════\nUżyj powyższych danych jako podstawy swojej analizy.'
-      : BASE_SYSTEM;
-
-    console.log('Context data:', contextData ? contextData.slice(0, 200) : 'none');
-
-    // Wywołaj DeepSeek R1 na Groq
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
         max_tokens: 2000,
+        temperature: 0.7,
         messages: [{ role: 'system', content: systemPrompt }, ...safe],
-        temperature: 0.6,
       })
     });
 
-    const groqData = await groqRes.json();
-    if (groqData.error) return res.status(502).json({ error: groqData.error.message });
+    const data = await r.json();
+    if (data.error) return res.status(502).json({ error: data.error.message });
 
-    let reply = groqData.choices[0].message.content;
+    const reply = data.choices[0].message.content;
 
-    // Usuń bloki <think>...</think> z DeepSeek R1 (wewnętrzne rozumowanie)
-    reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-    // Zapisz historię
+    // Save to DB
     try {
       await supabase.from('chat_history').insert({
         user_id: req.user.id,
-        user_message: lastUserMsg,
+        user_message: lastMsg,
         ai_reply: reply,
         model: 'llama-3.3-70b-versatile',
       });
-      await incrementCount(req.user.id);
-    } catch(e) { console.error('DB:', e.message); }
+      await incQueries(req.user.id);
+    } catch(e) {}
 
-    const remaining = req.userPlan === 'pro' ? 999 : FREE_LIMIT - req.queriesToday - 1;
-    res.json({ reply, plan: req.userPlan, remaining });
+    const remaining = req.plan === 'pro' ? 999 : FREE_LIMIT - req.queries - 1;
+    res.json({ reply, plan: req.plan, remaining });
 
-  } catch (err) {
-    res.status(502).json({ error: 'Błąd AI: ' + err.message });
+  } catch(e) {
+    res.status(502).json({ error: 'AI error: ' + e.message });
   }
 });
 
-// ── Stripe checkout ──────────────────────────────────────────
-app.post('/api/create-checkout', requireAuth, async (req, res) => {
+// ── GET /api/chart/:symbol ────────────────────────────────────
+app.get('/api/chart/:symbol', auth, async (req, res) => {
+  const sym = req.params.symbol;
+  const type = req.query.type || 'crypto';
+  const interval = req.query.interval || '1d';
+  const limit = parseInt(req.query.limit) || 90;
+
   try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card', 'blik', 'p24'],
-      mode: 'subscription',
-      line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro', description: 'Nielimitowane analizy finansowe AI' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
-      customer_email: req.user.email,
-      client_reference_id: req.user.id,
-      success_url: process.env.FRONTEND_URL + '?upgraded=true',
-      cancel_url: process.env.FRONTEND_URL + '?cancelled=true',
-      metadata: { user_id: req.user.id }
-    });
-    res.json({ url: session.url });
-  } catch(err) { res.status(500).json({ error: 'Błąd Stripe: ' + err.message }); }
+    if (type === 'crypto') {
+      // Konwertuj symbol na Binance format
+      const binSym = BINANCE_SYMBOLS[sym.toLowerCase()] || sym.toUpperCase() + 'USDT';
+
+      const [klines, ticker, fg] = await Promise.all([
+        getBinanceChart(binSym, interval, limit),
+        getBinanceTicker(binSym),
+        getFearGreed(),
+      ]);
+
+      if (!klines || !klines.length) {
+        return res.status(404).json({ error: `No data for ${sym}` });
+      }
+
+      return res.json({
+        symbol: binSym,
+        type: 'crypto',
+        interval,
+        klines,
+        meta: {
+          price: ticker?.price,
+          change24h: ticker?.change24h,
+          volume24h: ticker?.volume24h,
+          high24h: ticker?.high24h,
+          low24h: ticker?.low24h,
+          fearGreed: fg ? { value: fg.value, label: fg.value_classification } : null,
+        }
+      });
+
+    } else {
+      // Akcje przez Alpha Vantage
+      const size = limit <= 90 ? 'compact' : 'full';
+      const r = await fetch(
+        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${sym.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
+      );
+      const d = await r.json();
+      const ts = d['Time Series (Daily)'];
+      if (!ts) return res.status(404).json({ error: `No stock data for ${sym}` });
+
+      const entries = Object.entries(ts)
+        .sort((a, b) => a[0] < b[0] ? -1 : 1)
+        .slice(-limit);
+
+      const klines = entries.map(([date, v]) => ({
+        t: new Date(date).getTime(),
+        o: parseFloat(v['1. open']),
+        h: parseFloat(v['2. high']),
+        l: parseFloat(v['3. low']),
+        c: parseFloat(v['4. close']),
+        v: parseFloat(v['5. volume']),
+      }));
+
+      const last = klines[klines.length - 1];
+      const prev = klines[klines.length - 2];
+      const change = prev ? ((last.c - prev.c) / prev.c * 100) : 0;
+
+      return res.json({
+        symbol: sym.toUpperCase(),
+        type: 'stock',
+        interval,
+        klines,
+        meta: { price: last.c, change24h: change, volume24h: last.v }
+      });
+    }
+
+  } catch(e) {
+    res.status(502).json({ error: 'Chart error: ' + e.message });
+  }
 });
 
-// ── Stripe Webhook ───────────────────────────────────────────
-app.post('/api/webhook', async (req, res) => {
-  let event;
+// ── GET /api/ticker/:symbol ───────────────────────────────────
+app.get('/api/ticker/:symbol', auth, async (req, res) => {
+  const sym = req.params.symbol.toUpperCase();
+  const binSym = BINANCE_SYMBOLS[sym.toLowerCase()] || sym + 'USDT';
   try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
-  } catch(err) { return res.status(400).json({ error: err.message }); }
-
-  if (event.type === 'checkout.session.completed') {
-    const s = event.data.object;
-    const userId = s.metadata?.user_id || s.client_reference_id;
-    if (userId) await supabase.from('profiles').upsert({ id: userId, plan: 'pro', stripe_customer_id: s.customer }, { onConflict: 'id' });
+    const ticker = await getBinanceTicker(binSym);
+    if (!ticker) return res.status(404).json({ error: 'Not found' });
+    res.json(ticker);
+  } catch(e) {
+    res.status(502).json({ error: e.message });
   }
-  if (event.type === 'customer.subscription.deleted') {
-    const s = event.data.object;
-    const { data } = await supabase.from('profiles').select('id').eq('stripe_customer_id', s.customer).single();
-    if (data) await supabase.from('profiles').update({ plan: 'free' }).eq('id', data.id);
-  }
-  res.json({ received: true });
 });
 
-// ── GET /api/profile ─────────────────────────────────────────
-app.get('/api/profile', requireAuth, async (req, res) => {
+// ── GET /api/profile ──────────────────────────────────────────
+app.get('/api/profile', auth, async (req, res) => {
   const { data } = await supabase.from('profiles').select('plan, queries_today, last_query_date').eq('id', req.user.id).single();
   const today = new Date().toISOString().slice(0, 10);
   const queries = data?.last_query_date?.slice(0, 10) === today ? (data.queries_today || 0) : 0;
@@ -327,103 +384,53 @@ app.get('/api/profile', requireAuth, async (req, res) => {
   res.json({ plan, queries_today: queries, limit: plan === 'pro' ? 999 : FREE_LIMIT, remaining: plan === 'pro' ? 999 : Math.max(0, FREE_LIMIT - queries) });
 });
 
-app.get('/api/history', requireAuth, async (req, res) => {
+// ── GET /api/history ──────────────────────────────────────────
+app.get('/api/history', auth, async (req, res) => {
   const { data, error } = await supabase.from('chat_history').select('id, user_message, ai_reply, created_at').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(50);
-  if (error) return res.status(500).json({ error: 'Błąd bazy' });
+  if (error) return res.status(500).json({ error: 'DB error' });
   res.json({ history: data || [] });
 });
 
-
-// ── GET /api/chart/:symbol ───────────────────────────────────
-app.get('/api/chart/:symbol', requireAuth, async (req, res) => {
-  const symbol = req.params.symbol.toLowerCase();
-  const days   = parseInt(req.query.days) || 30;
-  const type   = req.query.type || 'crypto';
-
+// ── Stripe checkout ───────────────────────────────────────────
+app.post('/api/create-checkout', auth, async (req, res) => {
   try {
-    if (type === 'crypto') {
-      // Spróbuj CoinGecko z retry
-      let r;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        r = await fetch(
-          `https://api.coingecko.com/api/v3/coins/${symbol}/market_chart?vs_currency=usd&days=${days}&interval=${days <= 1 ? 'minutely' : days <= 7 ? 'hourly' : 'daily'}`,
-          { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
-        );
-        if (r.status !== 429) break;
-        console.log('CoinGecko rate limit, retry', attempt + 1);
-        await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
-      }
-      if (!r.ok) {
-        const errText = await r.text();
-        console.error('CoinGecko error:', r.status, errText.slice(0, 200));
-        return res.status(404).json({ error: `CoinGecko błąd ${r.status}: ${symbol}` });
-      }
-      const d = await r.json();
-
-      const prices  = (d.prices || []).map(p => ({ t: p[0], v: p[1] }));
-      const volumes = (d.total_volumes || []).map(p => ({ t: p[0], v: p[1] }));
-
-      const infoR = await fetch(
-        `https://api.coingecko.com/api/v3/simple/price?ids=${symbol}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`,
-        { headers: { 'Accept': 'application/json', 'User-Agent': 'FinAI/1.0' } }
-      );
-      const info = await infoR.json();
-      const meta = info[symbol] || {};
-
-      return res.json({
-        symbol, type: 'crypto', days, prices, volumes,
-        meta: {
-          price:     meta.usd,
-          change24h: meta.usd_24h_change,
-          marketCap: meta.usd_market_cap,
-          vol24h:    meta.usd_24h_vol,
-        }
-      });
-
-    } else {
-      const size = days <= 90 ? 'compact' : 'full';
-      const r = await fetch(
-        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${symbol.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
-      );
-      const d = await r.json();
-      const ts = d['Time Series (Daily)'];
-      if (!ts) return res.status(404).json({ error: `Nie znaleziono akcji: ${symbol}` });
-
-      const entries = Object.entries(ts)
-        .sort((a, b) => a[0] < b[0] ? -1 : 1)
-        .slice(-days);
-
-      const prices  = entries.map(([date, v]) => ({ t: new Date(date).getTime(), v: parseFloat(v['4. close']) }));
-      const volumes = entries.map(([date, v]) => ({ t: new Date(date).getTime(), v: parseFloat(v['5. volume']) }));
-
-      const last   = prices[prices.length - 1]?.v;
-      const prev   = prices[prices.length - 2]?.v || last;
-      const change = prev ? ((last - prev) / prev * 100) : 0;
-
-      return res.json({
-        symbol: symbol.toUpperCase(), type: 'stock', days, prices, volumes,
-        meta: { price: last, change24h: change, marketCap: null, vol24h: null }
-      });
-    }
-
-  } catch (err) {
-    res.status(502).json({ error: 'Błąd pobierania danych: ' + err.message });
-  }
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card', 'blik', 'p24'],
+      mode: 'subscription',
+      line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
+      customer_email: req.user.email,
+      client_reference_id: req.user.id,
+      success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
+      cancel_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?cancelled=true',
+      metadata: { user_id: req.user.id }
+    });
+    res.json({ url: session.url });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
-app.get('/health', (_, res) => res.json({ status: 'ok', model: 'llama-3.3-70b-versatile', rag: true }));
-
-
-// ── Keep-alive — pinguje siebie co 14 minut żeby Render nie zasnął ──────────
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
-setInterval(async () => {
+// ── Stripe webhook ────────────────────────────────────────────
+app.post('/api/webhook', async (req, res) => {
+  let event;
   try {
-    const r = await fetch(SELF_URL + '/health');
-    console.log('Keep-alive ping:', r.status);
-  } catch(e) {
-    console.log('Keep-alive failed:', e.message);
-  }
-}, 14 * 60 * 1000); // co 14 minut
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch(e) { return res.status(400).json({ error: e.message }); }
 
-app.listen(PORT, () => console.log('FinAI v3 (DeepSeek R1 + RAG) na porcie ' + PORT));
+  if (event.type === 'checkout.session.completed') {
+    const s = event.data.object;
+    const uid = s.metadata?.user_id || s.client_reference_id;
+    if (uid) await supabase.from('profiles').upsert({ id: uid, plan: 'pro', stripe_customer_id: s.customer }, { onConflict: 'id' });
+  }
+  if (event.type === 'customer.subscription.deleted') {
+    const { data } = await supabase.from('profiles').select('id').eq('stripe_customer_id', event.data.object.customer).single();
+    if (data) await supabase.from('profiles').update({ plan: 'free' }).eq('id', data.id);
+  }
+  res.json({ received: true });
+});
+
+// ── Health + keep-alive ───────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status: 'ok', v: 2, source: 'binance' }));
+
+const SELF = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
+setInterval(() => fetch(SELF + '/health').catch(() => {}), 14 * 60 * 1000);
+
+app.listen(PORT, () => console.log(`FinAI v2 on port ${PORT}`));
