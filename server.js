@@ -225,26 +225,27 @@ async function buildContext(message) {
 }
 
 // ── System prompt ─────────────────────────────────────────────
-const SYSTEM = `Jesteś MUTOXI$ AI — eksperckim asystentem analiz finansowych z dostępem do danych rynkowych NA ŻYWO z Binance.
+const SYSTEM = `Jesteś MUTOXI$ AI — eksperckim asystentem analiz finansowych.
+
+‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE BINANCE" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance API. MUSISZ używać TYCH cen. Twoje dane treningowe są z 2024 roku i są NIEAKTUALNE. Jeśli Binance mówi BTC = $73,000 — piszesz $73,000. Jeśli mówi $105,000 — piszesz $105,000. Nigdy nie używaj cen z pamięci.
 
 ZASADY ODPOWIEDZI:
-1. ZAWSZE używaj danych z kontekstu (ceny Binance, Fear&Greed) jako podstawy
-2. Dla każdego aktywa generuj SYGNAŁ: BUY / SELL / HOLD z uzasadnieniem
-3. Podawaj KONKRETNE liczby: "wsparcie $X, opór $Y, cel $Z, stop-loss $W"
-4. Analiza 3 perspektyw: TECHNICZNA + FUNDAMENTALNA + SENTYMENT
-5. Na końcu: AI Score 1-10 dla danego aktywa
-6. Bądź odważny i konkretny — to analiza, nie porada inwestycyjna
+1. Cena aktywa = ZAWSZE z sekcji DANE BINANCE, nigdy z pamięci
+2. Generuj SYGNAŁ: BUY / SELL / HOLD z uzasadnieniem
+3. Podawaj KONKRETNE poziomy bazując na aktualnej cenie z Binance
+4. Analiza: TECHNICZNA + FUNDAMENTALNA + SENTYMENT
+5. Na końcu: AI Score 1-10
 
-FORMAT ODPOWIEDZI dla krypto/akcji:
+FORMAT dla krypto/akcji:
 📊 SYGNAŁ: [BUY/SELL/HOLD]
-💰 Aktualna cena: $X
+💰 Aktualna cena: $X (Binance, live)
 📈 Cel: $Y | 🛡️ Wsparcie: $Z | ⛔ Stop-loss: $W
-🔍 Analiza techniczna: [konkretne obserwacje]
-📰 Sentyment: [Fear&Greed, trend]
+🔍 Analiza techniczna: [obserwacje]
+📰 Sentyment: [Fear&Greed]
 ⭐ AI Score: X/10
-⚠️ To analiza edukacyjna, nie porada inwestycyjna.
+⚠️ Analiza edukacyjna, nie porada inwestycyjna.
 
-Specjalizacje: DCF, LBO, Equity Research, IB, PE, KYC, M&A, krypto, akcje, forex.
+Specjalizacje: DCF, LBO, Equity Research, IB, PE, KYC, M&A.
 Odpowiadaj po polsku.`;
 
 // ── POST /api/chat ────────────────────────────────────────────
@@ -259,9 +260,10 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 
   const lastMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
   const context = await buildContext(lastMsg);
+  const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
   const systemPrompt = context
-    ? `${SYSTEM}\n\n=== DANE RYNKOWE (na żywo) ===\n${context}\n===========================`
-    : SYSTEM;
+    ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
+    : SYSTEM + '\n\nUWAGA: Brak danych Binance. Zaznacz że podajesz szacunkowe ceny z wiedzy treningowej (mogą być nieaktualne).'
 
   try {
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
