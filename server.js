@@ -83,7 +83,7 @@ function cached(key, ttl, fn) {
 
 // Binance ticker — cena + zmiana 24h
 async function getBinanceTicker(symbol) {
-  return cached(`ticker:${symbol}`, 30000, async () => {
+  return cached(`ticker:${symbol}`, 10000, async () => {
     const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
     if (!r.ok) return null;
     const d = await r.json();
@@ -159,6 +159,11 @@ const BINANCE_SYMBOLS = {
 
 // ── RAG — buduj kontekst dla AI ───────────────────────────────
 async function buildContext(message) {
+  // Wyczyść cache tickerów przed każdym zapytaniem AI
+  for (const key of cache.keys()) {
+    if (key.startsWith('ticker:')) cache.delete(key);
+  }
+
   const msg = message.toLowerCase();
   const parts = [`TIME: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
