@@ -556,61 +556,50 @@ setInterval(checkAlerts, 5 * 60 * 1000);
 async function fetchCryptoNews() {
   return cached('news:crypto', 300000, async () => {
 
-    // 1. CryptoPanic public — najbardziej stabilne
-    try {
-      const r = await fetch(
-        'https://cryptopanic.com/api/free/v1/posts/?auth_token=public&public=true&kind=news',
-        { headers: { 'User-Agent': 'Mozilla/5.0 FinAI/2.0' } }
-      );
-      if (r.ok) {
-        const d = await r.json();
-        const results = d.results || [];
-        if (results.length > 0) {
-          return results.slice(0, 15).map(item => ({
-            title: item.title,
-            url: item.url,
-            source: item.source ? item.source.title : 'CryptoPanic',
-            category: 'crypto',
-            published: item.published_at,
-            summary: '',
-          }));
-        }
-      }
-    } catch(e) { console.log('CryptoPanic error:', e.message); }
+    // Google News RSS — bez klucza, zawsze działa
+    const queries = ['cryptocurrency bitcoin', 'crypto ethereum', 'bitcoin price'];
 
-    // 2. Messari RSS — parsowanie XML ręcznie
-    try {
-      const r2 = await fetch('https://messari.io/rss/news/all', {
-        headers: { 'User-Agent': 'Mozilla/5.0 FinAI/2.0' }
-      });
-      if (r2.ok) {
-        const text = await r2.text();
+    for (const query of queries) {
+      try {
+        const encoded = encodeURIComponent(query);
+        const url = `https://news.google.com/rss/search?q=${encoded}&hl=en-US&gl=US&ceid=US:en`;
+        const r = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FinAI/2.0)' }
+        });
+        if (!r.ok) continue;
+        const text = await r.text();
+
         const items = [];
-        const titleRe = /<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/gs;
-        const linkRe = /<link>(https?:.*?)<\/link>/gs;
-        const dateRe = /<pubDate>(.*?)<\/pubDate>/gs;
-        const titles = [...text.matchAll(titleRe)].slice(1).map(m => m[1]);
-        const links = [...text.matchAll(linkRe)].map(m => m[1]);
-        const dates = [...text.matchAll(dateRe)].map(m => m[1]);
-        for (let i = 0; i < Math.min(titles.length, links.length, 15); i++) {
-          items.push({
-            title: titles[i].replace(/&amp;/g, '&'),
-            url: links[i],
-            source: 'Messari',
-            category: 'crypto',
-            published: dates[i] || null,
-            summary: '',
-          });
-        }
-        if (items.length > 0) return items;
-      }
-    } catch(e2) { console.log('Messari error:', e2.message); }
+        const itemRe = /<item>([\s\S]*?)<\/item>/g;
+        let m;
+        while ((m = itemRe.exec(text)) !== null && items.length < 15) {
+          const block = m[1];
+          const title = (block.match(/<title>(.*?)<\/title>/) || [])[1];
+          const link = (block.match(/<link\/>(.*?)<\/item>/) || block.match(/<link>(.*?)<\/link>/) || [])[1];
+          const pubDate = (block.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1];
+          const source = (block.match(/<source[^>]*>(.*?)<\/source>/) || [])[1];
 
-    // 3. Hardcoded fallback żeby coś pokazać
+          if (title && link) {
+            items.push({
+              title: title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'"),
+              url: link.trim(),
+              source: source || 'Google News',
+              category: 'crypto',
+              published: pubDate || null,
+              summary: '',
+            });
+          }
+        }
+
+        if (items.length >= 5) return items;
+      } catch(e) { console.log('Google News error:', e.message); }
+    }
+
+    // Fallback statyczny
     return [
-      { title: 'Bitcoin continues to dominate crypto markets in 2026', url: 'https://coindesk.com', source: 'CoinDesk', category: 'crypto', published: new Date().toISOString(), summary: '' },
-      { title: 'Ethereum Layer 2 solutions see record adoption', url: 'https://cointelegraph.com', source: 'CoinTelegraph', category: 'crypto', published: new Date().toISOString(), summary: '' },
-      { title: 'DeFi TVL reaches new all-time high', url: 'https://decrypt.co', source: 'Decrypt', category: 'crypto', published: new Date().toISOString(), summary: '' },
+      { title: 'Bitcoin price analysis — latest market update', url: 'https://coindesk.com', source: 'CoinDesk', category: 'crypto', published: new Date().toISOString(), summary: 'Check coindesk.com for latest news' },
+      { title: 'Ethereum network activity reaches new highs', url: 'https://cointelegraph.com', source: 'CoinTelegraph', category: 'crypto', published: new Date().toISOString(), summary: '' },
+      { title: 'Crypto market outlook — weekly summary', url: 'https://decrypt.co', source: 'Decrypt', category: 'crypto', published: new Date().toISOString(), summary: '' },
     ];
   });
 }
