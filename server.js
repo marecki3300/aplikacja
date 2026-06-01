@@ -427,6 +427,300 @@ app.post('/api/webhook', async (req, res) => {
   res.json({ received: true });
 });
 
+
+// ══════════════════════════════════════════════════════════════
+// PORTFOLIO TRACKER
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/portfolio', auth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('portfolio')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: 'DB error' });
+
+  // Pobierz aktualne ceny dla wszystkich pozycji
+  const enriched = await Promise.all((data || []).map(async (pos) => {
+    let currentPrice = null;
+    try {
+      const binSym = BINANCE_SYMBOLS[pos.symbol.toLowerCase()] || pos.symbol.toUpperCase() + 'USDT';
+      const ticker = await getBinanceTicker(binSym);
+      currentPrice = ticker?.price || null;
+    } catch(e) {}
+
+    const pnl = currentPrice ? (currentPrice - pos.buy_price) * pos.amount : null;
+    const pnlPct = currentPrice ? ((currentPrice - pos.buy_price) / pos.buy_price * 100) : null;
+    const value = currentPrice ? currentPrice * pos.amount : pos.buy_price * pos.amount;
+
+    return { ...pos, currentPrice, pnl, pnlPct, value };
+  }));
+
+  const totalValue = enriched.reduce((s, p) => s + (p.value || 0), 0);
+  const totalPnl = enriched.reduce((s, p) => s + (p.pnl || 0), 0);
+
+  res.json({ positions: enriched, totalValue, totalPnl });
+});
+
+app.post('/api/portfolio', auth, async (req, res) => {
+  const { symbol, name, amount, buy_price, buy_date, notes } = req.body;
+  if (!symbol || !amount || !buy_price) return res.status(400).json({ error: 'Missing fields' });
+
+  const { data, error } = await supabase
+    .from('portfolio')
+    .insert({ user_id: req.user.id, symbol, name: name || symbol, amount, buy_price, buy_date, notes })
+    .select().single();
+
+  if (error) return res.status(500).json({ error: 'DB error' });
+  res.json({ position: data });
+});
+
+app.delete('/api/portfolio/:id', auth, async (req, res) => {
+  const { error } = await supabase
+    .from('portfolio')
+    .delete()
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+
+  if (error) return res.status(500).json({ error: 'DB error' });
+  res.json({ deleted: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// PRICE ALERTS
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/alerts', auth, async (req, res) => {
+  const { data } = await supabase
+    .from('price_alerts')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .eq('triggered', false)
+    .order('created_at', { ascending: false });
+  res.json({ alerts: data || [] });
+});
+
+app.post('/api/alerts', auth, async (req, res) => {
+  const { symbol, target, direction } = req.body;
+  if (!symbol || !target || !direction) return res.status(400).json({ error: 'Missing fields' });
+
+  const { data, error } = await supabase
+    .from('price_alerts')
+    .insert({ user_id: req.user.id, symbol, target, direction })
+    .select().single();
+
+  if (error) return res.status(500).json({ error: 'DB error' });
+  res.json({ alert: data });
+});
+
+app.delete('/api/alerts/:id', auth, async (req, res) => {
+  await supabase.from('price_alerts').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+  res.json({ deleted: true });
+});
+
+// Sprawdź alerty co 5 minut
+async function checkAlerts() {
+  try {
+    const { data: alerts } = await supabase
+      .from('price_alerts')
+      .select('*, profiles(plan)')
+      .eq('triggered', false)
+      .limit(100);
+
+    if (!alerts || !alerts.length) return;
+
+    for (const alert of alerts) {
+      const binSym = BINANCE_SYMBOLS[alert.symbol.toLowerCase()] || alert.symbol.toUpperCase() + 'USDT';
+      const ticker = await getBinanceTicker(binSym);
+      if (!ticker) continue;
+
+      const triggered =
+        (alert.direction === 'above' && ticker.price >= alert.target) ||
+        (alert.direction === 'below' && ticker.price <= alert.target);
+
+      if (triggered) {
+        await supabase.from('price_alerts').update({ triggered: true }).eq('id', alert.id);
+        console.log(`Alert triggered: ${alert.symbol} ${alert.direction} ${alert.target} (current: ${ticker.price})`);
+      }
+    }
+  } catch(e) {}
+}
+
+setInterval(checkAlerts, 5 * 60 * 1000);
+
+// ══════════════════════════════════════════════════════════════
+// NEWS FEED — CryptoPanic + Yahoo Finance RSS
+// ══════════════════════════════════════════════════════════════
+
+async function fetchCryptoNews() {
+  return cached('news:crypto', 600000, async () => {
+    const sources = [
+      // CoinDesk RSS
+      'https://feeds.feedburner.com/CoinDesk',
+      // CoinTelegraph RSS
+      'https://cointelegraph.com/rss',
+      // Decrypt RSS
+      'https://decrypt.co/feed',
+    ];
+
+    // Użyj publicznego RSS-to-JSON konwertera
+    try {
+      const r = await fetch(
+        'https://api.rss2json.com/v1/api.json?rss_url=https://cointelegraph.com/rss&count=20'
+      );
+      const d = await r.json();
+      if (d.status === 'ok' && d.items) {
+        return d.items.slice(0, 15).map(item => ({
+          title: item.title,
+          url: item.link,
+          source: 'CoinTelegraph',
+          category: 'crypto',
+          published: item.pubDate,
+          summary: item.description?.replace(/<[^>]*>/g, '').slice(0, 200),
+        }));
+      }
+    } catch(e) {}
+
+    // Fallback — CoinDesk
+    try {
+      const r2 = await fetch(
+        'https://api.rss2json.com/v1/api.json?rss_url=https://feeds.feedburner.com/CoinDesk&count=20'
+      );
+      const d2 = await r2.json();
+      if (d2.status === 'ok' && d2.items) {
+        return d2.items.slice(0, 15).map(item => ({
+          title: item.title,
+          url: item.link,
+          source: 'CoinDesk',
+          category: 'crypto',
+          published: item.pubDate,
+          summary: item.description?.replace(/<[^>]*>/g, '').slice(0, 200),
+        }));
+      }
+    } catch(e2) {}
+
+    // Fallback 2 — CryptoPanic public
+    try {
+      const r3 = await fetch('https://cryptopanic.com/api/free/v1/posts/?auth_token=public&public=true');
+      const d3 = await r3.json();
+      return (d3.results || []).slice(0, 15).map(item => ({
+        title: item.title,
+        url: item.url,
+        source: item.source?.title || 'CryptoPanic',
+        category: 'crypto',
+        published: item.published_at,
+      }));
+    } catch(e3) {}
+
+    return [];
+  });
+}
+
+app.get('/api/news', auth, async (req, res) => {
+  const category = req.query.category || 'crypto';
+
+  try {
+    const news = await fetchCryptoNews();
+    res.json({ news, category });
+  } catch(e) {
+    res.status(502).json({ error: 'News fetch error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// DCF/LBO CALCULATOR
+// ══════════════════════════════════════════════════════════════
+
+app.post('/api/calculate/dcf', auth, async (req, res) => {
+  const { revenue, ebitda_margin, growth_rate, wacc, years, terminal_growth } = req.body;
+
+  if (!revenue || !ebitda_margin || !wacc) {
+    return res.status(400).json({ error: 'Missing: revenue, ebitda_margin, wacc' });
+  }
+
+  const r = parseFloat(revenue);
+  const margin = parseFloat(ebitda_margin) / 100;
+  const g = parseFloat(growth_rate || 5) / 100;
+  const w = parseFloat(wacc) / 100;
+  const n = parseInt(years || 5);
+  const tg = parseFloat(terminal_growth || 2) / 100;
+
+  const projections = [];
+  let totalPV = 0;
+  let currentRevenue = r;
+
+  for (let i = 1; i <= n; i++) {
+    currentRevenue *= (1 + g);
+    const ebitda = currentRevenue * margin;
+    const fcf = ebitda * 0.7; // uproszczone założenie
+    const pv = fcf / Math.pow(1 + w, i);
+    totalPV += pv;
+    projections.push({
+      year: i,
+      revenue: Math.round(currentRevenue),
+      ebitda: Math.round(ebitda),
+      fcf: Math.round(fcf),
+      pv: Math.round(pv),
+    });
+  }
+
+  const lastFCF = projections[n-1].fcf;
+  const terminalValue = (lastFCF * (1 + tg)) / (w - tg);
+  const terminalPV = terminalValue / Math.pow(1 + w, n);
+  const enterpriseValue = totalPV + terminalPV;
+
+  res.json({
+    projections,
+    terminalValue: Math.round(terminalValue),
+    terminalPV: Math.round(terminalPV),
+    pvFCF: Math.round(totalPV),
+    enterpriseValue: Math.round(enterpriseValue),
+    evRevenue: (enterpriseValue / r).toFixed(1),
+    evEbitda: (enterpriseValue / (r * margin)).toFixed(1),
+    assumptions: { revenue: r, ebitda_margin, growth_rate, wacc, years: n, terminal_growth },
+  });
+});
+
+app.post('/api/calculate/lbo', auth, async (req, res) => {
+  const { ebitda, entry_multiple, debt_pct, exit_multiple, years, interest_rate } = req.body;
+
+  if (!ebitda || !entry_multiple || !exit_multiple) {
+    return res.status(400).json({ error: 'Missing: ebitda, entry_multiple, exit_multiple' });
+  }
+
+  const e = parseFloat(ebitda);
+  const entryEV = e * parseFloat(entry_multiple);
+  const debtRatio = parseFloat(debt_pct || 60) / 100;
+  const debt = entryEV * debtRatio;
+  const equity = entryEV * (1 - debtRatio);
+  const ir = parseFloat(interest_rate || 6) / 100;
+  const n = parseInt(years || 5);
+  const exitEV = e * parseFloat(exit_multiple);
+
+  // Uproszczone spłaty długu
+  const annualRepayment = debt * 0.1;
+  const remainingDebt = Math.max(0, debt - annualRepayment * n);
+  const exitEquity = exitEV - remainingDebt;
+
+  // IRR (uproszczony)
+  const moic = exitEquity / equity;
+  const irr = (Math.pow(moic, 1/n) - 1) * 100;
+
+  res.json({
+    entryEV: Math.round(entryEV),
+    debt: Math.round(debt),
+    equity: Math.round(equity),
+    exitEV: Math.round(exitEV),
+    remainingDebt: Math.round(remainingDebt),
+    exitEquity: Math.round(exitEquity),
+    moic: moic.toFixed(2),
+    irr: irr.toFixed(1),
+    years: n,
+    assumptions: { ebitda: e, entry_multiple, exit_multiple, debt_pct, interest_rate },
+  });
+});
+
 // ── Health + keep-alive ───────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok', v: 2, source: 'binance' }));
 
