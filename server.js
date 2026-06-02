@@ -159,19 +159,13 @@ const BINANCE_SYMBOLS = {
 
 // ── RAG — buduj kontekst dla AI ───────────────────────────────
 async function buildContext(message) {
-  // Wyczyść cache tickerów przed każdym zapytaniem AI
-  for (const key of cache.keys()) {
-    if (key.startsWith('ticker:')) cache.delete(key);
-  }
-
   const msg = message.toLowerCase();
-  const parts = [`TIME: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
+  const parts = [`CZAS: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
 
-  // Krypto przez Binance
   const cryptoKeywords = {
-    'bitcoin|btc': 'BTCUSDT',
-    'ethereum|eth': 'ETHUSDT',
+    'bitcoin|btc|btcusdt': 'BTCUSDT',
+    'ethereum|eth|ethusd': 'ETHUSDT',
     'solana|sol': 'SOLUSDT',
     'xrp|ripple': 'XRPUSDT',
     'bnb|binance coin': 'BNBUSDT',
@@ -180,12 +174,33 @@ async function buildContext(message) {
     'avax|avalanche': 'AVAXUSDT',
   };
 
+  // Zawsze pobierz BTC jeśli jakiekolwiek pytanie o krypto/analizę/cenę
+  const isCryptoQuery = Object.keys(cryptoKeywords).some(k => k.split('|').some(w => msg.includes(w)))
+    || msg.includes('krypto') || msg.includes('crypto') || msg.includes('analiz')
+    || msg.includes('cen') || msg.includes('kurs') || msg.includes('rynek')
+    || msg.includes('bitcoin') || msg.includes('btc');
+
+  if (isCryptoQuery) {
+    // Zawsze pobierz BTC jako bazowy punkt odniesienia
+    promises.push(
+      getBinanceTicker('BTCUSDT').then(d => {
+        if (d) {
+          parts.push(`BITCOIN (BTCUSDT): $${d.price.toLocaleString('en-US', {maximumFractionDigits: 0})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% | Vol24h: $${(d.volume24h/1e6).toFixed(0)}M | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [BINANCE LIVE]`);
+        } else {
+          parts.push('BTCUSDT: błąd pobierania z Binance');
+        }
+      }).catch(e => parts.push('BTCUSDT: error - ' + e.message))
+    );
+  }
+
+  // Pobierz dodatkowe monety jeśli pytanie konkretne
   for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
+    if (binSym === 'BTCUSDT') continue; // już pobrane
     if (keys.split('|').some(k => msg.includes(k))) {
       promises.push(
-        getBinanceTicker(binSym).then(d => d &&
-          parts.push(`${binSym}: $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% | Vol: $${(d.volume24h/1e6).toFixed(0)}M | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [Binance]`)
-        )
+        getBinanceTicker(binSym).then(d => {
+          if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [BINANCE LIVE]`);
+        }).catch(() => {})
       );
     }
   }
