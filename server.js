@@ -266,21 +266,63 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     : SYSTEM + '\n\nUWAGA: Brak danych Binance. Zaznacz że podajesz szacunkowe ceny z wiedzy treningowej (mogą być nieaktualne).'
 
   try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 2000,
-        temperature: 0.7,
-        messages: [{ role: 'system', content: systemPrompt }, ...safe],
-      })
-    });
+    // Gemini jako główny model, Groq jako fallback
+    const GEMINI_KEY = process.env.GEMINI_API_KEY;
+    let reply = null;
 
-    const data = await r.json();
-    if (data.error) return res.status(502).json({ error: data.error.message });
+    // 1. Próbuj Gemini 2.0 Flash
+    if (GEMINI_KEY) {
+      try {
+        const geminiMessages = safe.map(m => ({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: m.content }]
+        }));
 
-    const reply = data.choices[0].message.content;
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_KEY}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system_instruction: { parts: [{ text: systemPrompt }] },
+              contents: geminiMessages,
+              generationConfig: {
+                temperature: 0.7,
+                maxOutputTokens: 2000,
+              }
+            })
+          }
+        );
+
+        const geminiData = await geminiRes.json();
+        if (geminiData.candidates?.[0]?.content?.parts?.[0]?.text) {
+          reply = geminiData.candidates[0].content.parts[0].text;
+          console.log('Model: Gemini 2.0 Flash');
+        } else {
+          console.log('Gemini error:', JSON.stringify(geminiData).slice(0, 200));
+        }
+      } catch(e) {
+        console.log('Gemini failed:', e.message);
+      }
+    }
+
+    // 2. Fallback — Groq Llama
+    if (!reply) {
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 2000,
+          temperature: 0.7,
+          messages: [{ role: 'system', content: systemPrompt }, ...safe],
+        })
+      });
+      const groqData = await groqRes.json();
+      if (groqData.error) return res.status(502).json({ error: groqData.error.message });
+      reply = groqData.choices[0].message.content;
+      console.log('Model: Groq Llama 3.3 (fallback)');
+    }
 
     // Save to DB
     try {
