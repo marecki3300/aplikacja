@@ -81,19 +81,86 @@ function cached(key, ttl, fn) {
   return fn().then(data => { cache.set(key, { data, ts: now }); return data; });
 }
 
-// Binance ticker — cena + zmiana 24h
+// Binance ticker — cena + zmiana 24h (z fallback na CoinGecko)
+const COINGECKO_MAP = {
+  'BTCUSDT': 'bitcoin', 'ETHUSDT': 'ethereum', 'SOLUSDT': 'solana',
+  'XRPUSDT': 'ripple', 'BNBUSDT': 'binancecoin', 'ADAUSDT': 'cardano',
+  'DOGEUSDT': 'dogecoin', 'AVAXUSDT': 'avalanche-2', 'DOTUSDT': 'polkadot',
+  'LINKUSDT': 'chainlink',
+};
+
 async function getBinanceTicker(symbol) {
-  return cached(`ticker:${symbol}`, 10000, async () => {
-    const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
-    if (!r.ok) return null;
-    const d = await r.json();
-    return {
-      price: parseFloat(d.lastPrice),
-      change24h: parseFloat(d.priceChangePercent),
-      volume24h: parseFloat(d.quoteVolume),
-      high24h: parseFloat(d.highPrice),
-      low24h: parseFloat(d.lowPrice),
-    };
+  return cached(`ticker:${symbol}`, 15000, async () => {
+    // 1. Próbuj Binance
+    try {
+      const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (d.lastPrice) {
+          return {
+            price: parseFloat(d.lastPrice),
+            change24h: parseFloat(d.priceChangePercent),
+            volume24h: parseFloat(d.quoteVolume),
+            high24h: parseFloat(d.highPrice),
+            low24h: parseFloat(d.lowPrice),
+            source: 'Binance'
+          };
+        }
+      }
+    } catch(e) { console.log('Binance error:', e.message); }
+
+    // 2. Fallback — CoinGecko
+    const cgId = COINGECKO_MAP[symbol];
+    if (cgId) {
+      try {
+        const r2 = await fetch(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_high_24h=true&include_low_24h=true`,
+          { headers: { 'Accept': 'application/json', 'User-Agent': 'AURIMIQ/1.0' } }
+        );
+        if (r2.ok) {
+          const d2 = await r2.json();
+          const coin = d2[cgId];
+          if (coin) {
+            return {
+              price: coin.usd,
+              change24h: coin.usd_24h_change || 0,
+              volume24h: coin.usd_24h_vol || 0,
+              high24h: coin.usd_24h_high || coin.usd,
+              low24h: coin.usd_24h_low || coin.usd,
+              source: 'CoinGecko'
+            };
+          }
+        }
+      } catch(e2) { console.log('CoinGecko error:', e2.message); }
+    }
+
+    // 3. Fallback — Kraken
+    try {
+      const krakenSym = symbol.replace('USDT', '') + 'USD';
+      const r3 = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${krakenSym}`);
+      if (r3.ok) {
+        const d3 = await r3.json();
+        const pairs = Object.values(d3.result || {});
+        if (pairs.length > 0) {
+          const p = pairs[0];
+          const price = parseFloat(p.c[0]);
+          const open = parseFloat(p.o);
+          const change = open ? ((price - open) / open * 100) : 0;
+          return {
+            price,
+            change24h: change,
+            volume24h: parseFloat(p.v[1]) * price,
+            high24h: parseFloat(p.h[1]),
+            low24h: parseFloat(p.l[1]),
+            source: 'Kraken'
+          };
+        }
+      }
+    } catch(e3) { console.log('Kraken error:', e3.message); }
+
+    return null;
   });
 }
 
