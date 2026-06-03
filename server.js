@@ -425,7 +425,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 });
 
 // ── GET /api/chart/:symbol ────────────────────────────────────
-app.get('/api/chart/:symbol', auth, async (req, res) => {
+app.get('/api/chart/:symbol', async (req, res) => {
   const sym = req.params.symbol;
   const type = req.query.type || 'crypto';
   const interval = req.query.interval || '1d';
