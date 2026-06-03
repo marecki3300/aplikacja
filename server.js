@@ -471,26 +471,6 @@ async function buildContext(message) {
     );
   }
 
-  // Akcje
-  const stockKeywords = {
-    'apple|aapl': 'AAPL', 'tesla|tsla': 'TSLA',
-    'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
-    'google|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
-    'meta': 'META', 'netflix|nflx': 'NFLX',
-    'xtb': 'XTB.WA', 'orlen|pkn': 'PKN.WA',
-    'kghm': 'KGH.WA', 'cd projekt|cdpr': 'CDR.WA',
-  };
-
-  for (const [keys, sym] of Object.entries(stockKeywords)) {
-    if (keys.split('|').some(k => msg.includes(k))) {
-      promises.push(
-        getStockData(sym).then(d => d &&
-          parts.push(`${sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h.toFixed(2)}% [Alpha Vantage]`)
-        )
-      );
-    }
-  }
-
   await Promise.all(promises);
   return parts.length > 1 ? parts.join('\n') : null;
 }
