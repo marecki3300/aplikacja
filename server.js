@@ -93,7 +93,7 @@ async function getBinanceTicker(symbol) {
   return cached(`ticker:${symbol}`, 15000, async () => {
     // 1. Próbuj Binance
     try {
-      const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+      const r = await fetch(`https://api1.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
       });
       if (r.ok) {
@@ -168,7 +168,7 @@ async function getBinanceTicker(symbol) {
 async function getBinanceChart(symbol, interval, limit) {
   return cached(`chart:${symbol}:${interval}:${limit}`, 60000, async () => {
     const r = await fetch(
-      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+      `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
     );
     if (!r.ok) return null;
     const d = await r.json();
