@@ -1,4 +1,4 @@
-// FinAI v2 — Backend
+// AURIMIQ.ai — Backend
 // Stack: Express + Groq (Llama) + Binance + Supabase + Stripe
 // Deploy: Render.com
 
@@ -240,7 +240,7 @@ async function buildContext(message) {
 }
 
 // ── System prompt ─────────────────────────────────────────────
-const SYSTEM = `Jesteś MUTOXI$ AI — eksperckim asystentem analiz finansowych.
+const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowych.
 
 ‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE BINANCE" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance API. MUSISZ używać TYCH cen. Twoje dane treningowe są z 2024 roku i są NIEAKTUALNE. Jeśli Binance mówi BTC = $73,000 — piszesz $73,000. Jeśli mówi $105,000 — piszesz $105,000. Nigdy nie używaj cen z pamięci.
 
@@ -281,63 +281,62 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     : SYSTEM + '\n\nUWAGA: Brak danych Binance. Zaznacz że podajesz szacunkowe ceny z wiedzy treningowej (mogą być nieaktualne).'
 
   try {
-    // Gemini jako główny model, Groq jako fallback
-    const GEMINI_KEY = process.env.GEMINI_API_KEY;
+    // Claude Sonnet jako główny model, Groq jako fallback
+    const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
     let reply = null;
 
-    // 1. Próbuj Gemini 2.0 Flash
-    if (GEMINI_KEY) {
+    // 1. Claude Sonnet 4 — najlepszy model analityczny
+    if (CLAUDE_KEY) {
       try {
-        const geminiMessages = safe.map(m => ({
-          role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: m.content }]
-        }));
+        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': CLAUDE_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 2000,
+            system: systemPrompt,
+            messages: safe.map(m => ({ role: m.role, content: m.content })),
+          })
+        });
 
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_KEY}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              system_instruction: { parts: [{ text: systemPrompt }] },
-              contents: geminiMessages,
-              generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: 2000,
-              }
-            })
-          }
-        );
-
-        const geminiData = await geminiRes.json();
-        if (geminiData.candidates?.[0]?.content?.parts?.[0]?.text) {
-          reply = geminiData.candidates[0].content.parts[0].text;
-          console.log('Model: Gemini 2.0 Flash');
+        const claudeData = await claudeRes.json();
+        if (claudeData.content?.[0]?.text) {
+          reply = claudeData.content[0].text;
+          console.log('Model: Claude Sonnet 4.6');
         } else {
-          console.log('Gemini error:', JSON.stringify(geminiData).slice(0, 200));
+          console.log('Claude error:', JSON.stringify(claudeData).slice(0, 200));
         }
       } catch(e) {
-        console.log('Gemini failed:', e.message);
+        console.log('Claude failed:', e.message);
       }
     }
 
     // 2. Fallback — Groq Llama
     if (!reply) {
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          max_tokens: 2000,
-          temperature: 0.7,
-          messages: [{ role: 'system', content: systemPrompt }, ...safe],
-        })
-      });
-      const groqData = await groqRes.json();
-      if (groqData.error) return res.status(502).json({ error: groqData.error.message });
-      reply = groqData.choices[0].message.content;
-      console.log('Model: Groq Llama 3.3 (fallback)');
+      try {
+        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+          body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            max_tokens: 2000,
+            temperature: 0.7,
+            messages: [{ role: 'system', content: systemPrompt }, ...safe],
+          })
+        });
+        const groqData = await groqRes.json();
+        if (!groqData.error) {
+          reply = groqData.choices[0].message.content;
+          console.log('Model: Groq Llama 3.3 (fallback)');
+        }
+      } catch(e) {}
     }
+
+    if (!reply) return res.status(502).json({ error: 'AI unavailable' });
 
     // Save to DB
     try {
@@ -789,4 +788,4 @@ app.get('/health', (_, res) => res.json({ status: 'ok', v: 2, source: 'binance' 
 const SELF = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
 setInterval(() => fetch(SELF + '/health').catch(() => {}), 14 * 60 * 1000);
 
-app.listen(PORT, () => console.log(`FinAI v2 on port ${PORT}`));
+app.listen(PORT, () => console.log(`AURIMIQ.ai on port ${PORT}`));
