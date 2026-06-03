@@ -435,6 +435,19 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
   }
 });
 
+// ── GET /api/prices — wiele symboli naraz (dla Android) ─────
+app.get('/api/prices', auth, async (req, res) => {
+  const symbols = (req.query.symbols || 'BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT').split(',');
+  try {
+    const results = {};
+    await Promise.all(symbols.map(async (sym) => {
+      const ticker = await getBinanceTicker(sym.trim());
+      if (ticker) results[sym] = ticker;
+    }));
+    res.json({ prices: results, ts: Date.now() });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
 // ── GET /api/ticker/:symbol ───────────────────────────────────
 app.get('/api/ticker/:symbol', auth, async (req, res) => {
   const sym = req.params.symbol.toUpperCase();
