@@ -89,11 +89,141 @@ const COINGECKO_MAP = {
   'LINKUSDT': 'chainlink',
 };
 
+// ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
+async function getStockPrice(symbol) {
+  return cached(`stock:${symbol}`, 60000, async () => {
+    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+    try {
+      const r = await fetch(
+        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+      );
+      const d = await r.json();
+      const q = d['Global Quote'];
+      if (q && q['05. price']) {
+        return {
+          price: parseFloat(q['05. price']),
+          change24h: parseFloat(q['10. change percent'].replace('%','')),
+          volume24h: parseFloat(q['06. volume']) * parseFloat(q['05. price']),
+          high24h: parseFloat(q['03. high']),
+          low24h: parseFloat(q['04. low']),
+          source: 'AlphaVantage'
+        };
+      }
+    } catch(e) { console.log('AlphaVantage error:', e.message); }
+
+    // Fallback — Yahoo Finance przez proxy
+    try {
+      const r2 = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      const d2 = await r2.json();
+      const meta = d2?.chart?.result?.[0]?.meta;
+      if (meta?.regularMarketPrice) {
+        const price = meta.regularMarketPrice;
+        const prev = meta.chartPreviousClose || price;
+        return {
+          price,
+          change24h: ((price - prev) / prev * 100),
+          volume24h: meta.regularMarketVolume * price || 0,
+          high24h: meta.regularMarketDayHigh || price,
+          low24h: meta.regularMarketDayLow || price,
+          source: 'Yahoo'
+        };
+      }
+    } catch(e2) { console.log('Yahoo error:', e2.message); }
+    return null;
+  });
+}
+
+// ── FOREX ─────────────────────────────────────────────────────
+async function getForexRate(from, to) {
+  return cached(`forex:${from}${to}`, 60000, async () => {
+    try {
+      const r = await fetch(
+        `https://api.exchangerate-api.com/v4/latest/${from}`
+      );
+      const d = await r.json();
+      if (d.rates && d.rates[to]) {
+        const rate = d.rates[to];
+        return {
+          price: rate,
+          change24h: 0,
+          volume24h: 0,
+          high24h: rate,
+          low24h: rate,
+          source: 'ExchangeRate'
+        };
+      }
+    } catch(e) {}
+
+    // Fallback — open.er-api.com
+    try {
+      const r2 = await fetch(`https://open.er-api.com/v6/latest/${from}`);
+      const d2 = await r2.json();
+      if (d2.rates && d2.rates[to]) {
+        return {
+          price: d2.rates[to],
+          change24h: 0,
+          volume24h: 0,
+          high24h: d2.rates[to],
+          low24h: d2.rates[to],
+          source: 'ExchangeRate'
+        };
+      }
+    } catch(e2) {}
+
+    // Fallback 2 — NBP API dla PLN
+    if (to === 'PLN' || from === 'PLN') {
+      try {
+        const currency = from === 'PLN' ? to : from;
+        const r3 = await fetch(`https://api.nbp.pl/api/exchangerates/rates/a/${currency}/?format=json`);
+        const d3 = await r3.json();
+        const rate = d3.rates?.[0]?.mid;
+        if (rate) {
+          const finalRate = from === 'PLN' ? (1/rate) : rate;
+          return {
+            price: finalRate,
+            change24h: 0,
+            volume24h: 0,
+            high24h: finalRate,
+            low24h: finalRate,
+            source: 'NBP'
+          };
+        }
+      } catch(e3) {}
+    }
+    return null;
+  });
+}
+
+// ── UNIVERSAL TICKER — wykrywa typ symbolu ────────────────────
+const STOCK_SYMBOLS_LIST = ['AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','PKN.WA','KGH.WA','PKO.WA','CDR.WA','LPP.WA','PEO.WA'];
+const FOREX_PAIRS = {
+  'EURUSD': {from:'EUR',to:'USD'}, 'USDPLN': {from:'USD',to:'PLN'},
+  'EURPLN': {from:'EUR',to:'PLN'}, 'GBPUSD': {from:'GBP',to:'USD'},
+  'USDEUR': {from:'USD',to:'EUR'},
+};
+
+async function getUniversalTicker(symbol) {
+  // Forex
+  if (FOREX_PAIRS[symbol]) {
+    const {from, to} = FOREX_PAIRS[symbol];
+    return getForexRate(from, to);
+  }
+  // Akcje
+  if (STOCK_SYMBOLS_LIST.includes(symbol)) {
+    return getStockPrice(symbol);
+  }
+  // Krypto przez Binance
+  return getBinanceTicker(symbol);
+}
+
 async function getBinanceTicker(symbol) {
   return cached(`ticker:${symbol}`, 15000, async () => {
     // 1. Próbuj Binance
     try {
-      const r = await fetch(`https://api1.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+      const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
       });
       if (r.ok) {
@@ -168,7 +298,7 @@ async function getBinanceTicker(symbol) {
 async function getBinanceChart(symbol, interval, limit) {
   return cached(`chart:${symbol}:${interval}:${limit}`, 60000, async () => {
     const r = await fetch(
-      `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
     );
     if (!r.ok) return null;
     const d = await r.json();
@@ -262,13 +392,72 @@ async function buildContext(message) {
 
   // Pobierz dodatkowe monety jeśli pytanie konkretne
   for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
-    if (binSym === 'BTCUSDT') continue; // już pobrane
+    if (binSym === 'BTCUSDT') continue;
     if (keys.split('|').some(k => msg.includes(k))) {
       promises.push(
         getBinanceTicker(binSym).then(d => {
-          if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [BINANCE LIVE]`);
+          if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source || 'BINANCE'} LIVE]`);
         }).catch(() => {})
       );
+    }
+  }
+
+  // Akcje — Magnificent 7
+  const stockKeywords = {
+    'apple|aapl': 'AAPL', 'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
+    'google|alphabet|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
+    'meta|facebook': 'META', 'tesla|tsla': 'TSLA',
+    'orlen|pkn': 'PKN.WA', 'kghm': 'KGH.WA', 'pko': 'PKO.WA',
+    'akcj|stock|shares|magnificent': 'MULTI_STOCK',
+  };
+
+  for (const [keys, stockSym] of Object.entries(stockKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      if (stockSym === 'MULTI_STOCK') {
+        // Pobierz Mag7
+        ['AAPL','MSFT','NVDA','TSLA'].forEach(sym => {
+          promises.push(
+            getStockPrice(sym).then(d => {
+              if (d) parts.push(`${sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+            }).catch(() => {})
+          );
+        });
+      } else {
+        promises.push(
+          getStockPrice(stockSym).then(d => {
+            if (d) parts.push(`${stockSym}: $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+          }).catch(() => {})
+        );
+      }
+    }
+  }
+
+  // Forex
+  const forexKeywords = {
+    'eur|euro': {sym:'EURUSD', from:'EUR', to:'USD'},
+    'pln|złoty|zloty|usdpln': {sym:'USDPLN', from:'USD', to:'PLN'},
+    'eurpln': {sym:'EURPLN', from:'EUR', to:'PLN'},
+    'gbp|funt': {sym:'GBPUSD', from:'GBP', to:'USD'},
+    'forex|walut|kurs': {sym:'MULTI_FOREX', from:'', to:''},
+  };
+
+  for (const [keys, pair] of Object.entries(forexKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      if (pair.sym === 'MULTI_FOREX') {
+        [['USD','PLN'],['EUR','PLN'],['EUR','USD']].forEach(([f,t]) => {
+          promises.push(
+            getForexRate(f, t).then(d => {
+              if (d) parts.push(`${f}/${t}: ${d.price.toFixed(4)} [${d.source}]`);
+            }).catch(() => {})
+          );
+        });
+      } else {
+        promises.push(
+          getForexRate(pair.from, pair.to).then(d => {
+            if (d) parts.push(`${pair.from}/${pair.to}: ${d.price.toFixed(4)} [${d.source}]`);
+          }).catch(() => {})
+        );
+      }
     }
   }
 
@@ -309,7 +498,15 @@ async function buildContext(message) {
 // ── System prompt ─────────────────────────────────────────────
 const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowych.
 
-‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE BINANCE" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance API. MUSISZ używać TYCH cen. Twoje dane treningowe są z 2024 roku i są NIEAKTUALNE. Jeśli Binance mówi BTC = $73,000 — piszesz $73,000. Jeśli mówi $105,000 — piszesz $105,000. Nigdy nie używaj cen z pamięci.
+‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE Z BINANCE API" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance/AlphaVantage/ExchangeRate API. MUSISZ używać TYCH cen. Twoje dane treningowe są nieaktualne. Nigdy nie używaj cen z pamięci.
+
+ŹRÓDŁA DANYCH:
+- Krypto (BTC, ETH, SOL...): Binance API → CoinGecko → Kraken
+- Akcje (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance
+- Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
+- Metale (GOLD, SILVER): CoinGecko/OANDA
+
+Jeśli brak danych dla danego instrumentu — napisz że dane są niedostępne ale podaj analizę na podstawie znanych fundamentów.
 
 ZASADY ODPOWIEDZI:
 1. Cena aktywa = ZAWSZE z sekcji DANE BINANCE, nigdy z pamięci
@@ -425,7 +622,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 });
 
 // ── GET /api/chart/:symbol ────────────────────────────────────
-app.get('/api/chart/:symbol', async (req, res) => {
+app.get('/api/chart/:symbol', auth, async (req, res) => {
   const sym = req.params.symbol;
   const type = req.query.type || 'crypto';
   const interval = req.query.interval || '1d';
