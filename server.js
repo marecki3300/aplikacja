@@ -371,6 +371,32 @@ async function buildContext(message) {
     'avax|avalanche': 'AVAXUSDT',
   };
 
+  // Crisis/recesja — pobierz BTC + Gold jako wskaźniki makro
+  if (msg.includes('kryzys') || msg.includes('crisis') || msg.includes('recesj') || msg.includes('recession') || msg.includes('crash')) {
+    promises.push(
+      getBinanceTicker('BTCUSDT').then(d => {
+        if (d) parts.push(`BITCOIN (kryzys barometr): $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+      }).catch(() => {})
+    );
+    promises.push(
+      getBinanceTicker('ETHUSDT').then(d => {
+        if (d) parts.push(`ETHEREUM: $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}%`);
+      }).catch(() => {})
+    );
+    promises.push(
+      getForexRate('USD', 'PLN').then(d => {
+        if (d) parts.push(`USD/PLN: ${d.price.toFixed(4)} [${d.source}]`);
+      }).catch(() => {})
+    );
+    // Gold jako safe haven
+    promises.push(
+      getStockPrice('GLD').then(d => {
+        if (d) parts.push(`GOLD ETF (GLD): $${d.price.toFixed(2)} | 24h: ${d.change24h.toFixed(2)}% [safe haven]`);
+      }).catch(() => {})
+    );
+    parts.push('KONTEKST MAKRO: Sprawdź yield curve (2Y vs 10Y), Fear&Greed, VIX');
+  }
+
   // Zawsze pobierz BTC jeśli jakiekolwiek pytanie o krypto/analizę/cenę
   const isCryptoQuery = Object.keys(cryptoKeywords).some(k => k.split('|').some(w => msg.includes(w)))
     || msg.includes('krypto') || msg.includes('crypto') || msg.includes('analiz')
