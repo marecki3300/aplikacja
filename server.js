@@ -753,7 +753,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card', 'blik', 'p24'],
       mode: 'subscription',
-      line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
+    line_items: [{ price: 'price_1Tg3My2eFAwvdlMuz94RQOHP', quantity: 1 }],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
       success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
