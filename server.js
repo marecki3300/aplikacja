@@ -751,7 +751,7 @@ app.get('/api/history', auth, async (req, res) => {
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card', 'blik', 'p24'],
+      payment_method_types: ['card'],
       mode: 'subscription',
       line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
       customer_email: req.user.email,
