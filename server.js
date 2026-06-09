@@ -43,7 +43,7 @@ function auth(req, res, next) {
 }
 
 // ── Plan check ────────────────────────────────────────────────
-const FREE_LIMIT = 1;
+const FREE_LIMIT = 5;
 
 async function checkPlan(req, res, next) {
   const { data } = await supabase
@@ -751,9 +751,9 @@ app.get('/api/history', auth, async (req, res) => {
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
+      payment_method_types: ['card', 'blik', 'p24'],
       mode: 'subscription',
-    line_items: [{ price: 'price_1Tg3My2eFAwvdlMuz94RQOHP', quantity: 1 }],
+      line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
       success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
@@ -761,7 +761,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
       metadata: { user_id: req.user.id }
     });
     res.json({ url: session.url });
- } catch(e) { console.error('STRIPE ERROR:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Stripe webhook ────────────────────────────────────────────
