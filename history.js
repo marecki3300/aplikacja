@@ -1,0 +1,24 @@
+import { createClient } from '@supabase/supabase-js';
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+function decodeToken(token) {
+  const parts = token.split('.');
+  const padding = parts[1].length % 4;
+  const padded = padding ? parts[1] + '='.repeat(4 - padding) : parts[1];
+  return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const token = req.headers.authorization?.split('Bearer ')[1];
+  if (!token) return res.status(401).json({ error: 'Brak tokenu' });
+
+  try {
+    const payload = decodeToken(token);
+    const { data } = await supabase.from('chat_history').select('id, user_message, ai_reply, created_at').eq('user_id', payload.sub).order('created_at', { ascending: false }).limit(50);
+    res.json({ history: data || [] });
+  } catch(e) { res.status(401).json({ error: 'Błąd autoryzacji' }); }
+}
