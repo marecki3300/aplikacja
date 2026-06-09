@@ -751,7 +751,7 @@ app.get('/api/history', auth, async (req, res) => {
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card', 'blik', 'p24'],
+      payment_method_types: ['card'],
       mode: 'subscription',
     line_items: [{ price: 'price_1Tg3My2eFAwvdlMuz94RQOHP', quantity: 1 }],
       customer_email: req.user.email,
