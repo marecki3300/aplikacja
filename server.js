@@ -750,10 +750,17 @@ app.get('/api/history', auth, async (req, res) => {
 // ── Stripe checkout ───────────────────────────────────────────
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
+    const { currency = 'pln' } = req.body;
+    const PRICES = {
+      pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',
+      usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
+      eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',
+    };
+    const priceId = PRICES[currency] || PRICES.pln;
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'subscription',
-      line_items: [{ price_data: { currency: 'pln', product_data: { name: 'FinAI Pro' }, unit_amount: 4900, recurring: { interval: 'month' } }, quantity: 1 }],
+      line_items: [{ price: priceId, quantity: 1 }],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
       success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
@@ -761,7 +768,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
       metadata: { user_id: req.user.id }
     });
     res.json({ url: session.url });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('STRIPE ERROR:', e.message); res.status(500).json({ error: e.message }); }
+}); }
 });
 
 // ── Stripe webhook ────────────────────────────────────────────
