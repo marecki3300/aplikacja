@@ -579,7 +579,7 @@ app.get('/api/history', auth, async (req, res) => {
 // Price IDs per currency — utwórz je w Stripe Dashboard:
 // Product: AURIMIQ.ai Pro | Billing: recurring monthly
 const STRIPE_PRICES = {
-  pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',  // 49 PLN/mo
+  pln: 'price_1Th6zS2eFAwvdlMu59DYdPui',  // 49 PLN/mo
   usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',  // $12.99/mo
   eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',  // €11.99/mo
 };
@@ -615,15 +615,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     });
 
     res.json({ url: session.url });
-<<<<<<< HEAD
   } catch(e) {
     console.error('STRIPE ERROR:', e.message);
     res.status(500).json({ error: e.message });
   }
-=======
-  } catch(e) { console.error('STRIPE ERROR:', e.message); res.status(500).json({ error: e.message }); }
-}); 
->>>>>>> bddb74b7d53ebaf1ac4dc774da9df14f57c12e93
 });
 
 // ── Stripe webhook ────────────────────────────────────────────
