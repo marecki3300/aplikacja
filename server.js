@@ -600,7 +600,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'subscription',
-      locale,                          // ← język całego checkout UI
+      locale,
+      currency: cur,                   // ← wymusza walutę na checkout
       line_items: [{
         price: priceId,
         quantity: 1,
