@@ -578,10 +578,11 @@ app.get('/api/history', auth, async (req, res) => {
 
 // Price IDs per currency — utwórz je w Stripe Dashboard:
 // Product: AURIMIQ.ai Pro | Billing: recurring monthly
+// Jeden Price ID obsługuje PLN/EUR/USD automatycznie (multi-currency w Stripe)
 const STRIPE_PRICES = {
-  pln: 'price_1Th6zS2eFAwvdlMu59DYdPui',  // 49 PLN/mo
-  usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',  // $12.99/mo
-  eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',  // €11.99/mo
+  pln: 'price_1Th6zS2eFAwvdlMu59DYdPui',
+  usd: 'price_1Th6zS2eFAwvdlMu59DYdPui',
+  eur: 'price_1Th6zS2eFAwvdlMu59DYdPui',
 };
 
 // Locale map: język użytkownika → Stripe locale
