@@ -615,10 +615,15 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     });
 
     res.json({ url: session.url });
+<<<<<<< HEAD
   } catch(e) {
     console.error('STRIPE ERROR:', e.message);
     res.status(500).json({ error: e.message });
   }
+=======
+  } catch(e) { console.error('STRIPE ERROR:', e.message); res.status(500).json({ error: e.message }); }
+}); 
+>>>>>>> bddb74b7d53ebaf1ac4dc774da9df14f57c12e93
 });
 
 // ── Stripe webhook ────────────────────────────────────────────
