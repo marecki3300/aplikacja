@@ -43,7 +43,8 @@ function auth(req, res, next) {
 }
 
 // ── Plan check ────────────────────────────────────────────────
-const FREE_LIMIT = 5;
+const FREE_LIMIT = 1;
+const WELCOME_BONUS = 5;
 
 async function checkPlan(req, res, next) {
   const { data } = await supabase
