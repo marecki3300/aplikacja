@@ -113,7 +113,8 @@ const COINGECKO_MAP = {
 // ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
 async function getStockPrice(symbol) {
   return cached(`stock:${symbol}`, 60000, async () => {
-    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+    const AV_KEY = process.env.ALPHA_VANTAGE_KEY;
+    if (!AV_KEY) throw new Error('No AV key');
     try {
       const r = await fetch(
         `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
@@ -238,7 +239,7 @@ async function getUniversalTicker(symbol) {
 }
 
 async function getBinanceTicker(symbol) {
-  return cached(`ticker:${symbol}`, 15000, async () => {
+  return cached(`ticker:${symbol}`, 30000, async () => {
     try {
       const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
@@ -335,22 +336,6 @@ async function getFearGreed() {
   });
 }
 
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
-async function getStockData(symbol) {
-  return cached(`stock:${symbol}`, 300000, async () => {
-    const r = await fetch(
-      `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
-    );
-    const d = await r.json();
-    const q = d['Global Quote'];
-    if (!q || !q['05. price']) return null;
-    return {
-      price: parseFloat(q['05. price']),
-      change24h: parseFloat(q['10. change percent']),
-      volume24h: parseFloat(q['06. volume']),
-    };
-  });
-}
 
 const BINANCE_SYMBOLS = {
   'bitcoin': 'BTCUSDT', 'btc': 'BTCUSDT',
@@ -463,6 +448,8 @@ async function buildContext(message) {
     { keys: ['deutsche bank','deutschebank','db bank'],    sym: 'DB'      },
     { keys: ['airbus'],                                    sym: 'EADSY'   },
     { keys: ['dax'],                                       sym: 'MULTI_DAX'},
+    // SpaceX — IPO NYSE 12.06.2026
+    { keys: ['spacex','spcx'],                             sym: 'SPCX'    },
   ];
 
   // "wszystkie akcje" / "magnificent" / "mag7" / "wig20" / "dax"
@@ -710,6 +697,7 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
 
     } else {
       const size = limit <= 90 ? 'compact' : 'full';
+      const AV_KEY = process.env.ALPHA_VANTAGE_KEY;
       const r = await fetch(
         `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${sym.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
       );
