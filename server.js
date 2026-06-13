@@ -421,10 +421,16 @@ async function buildContext(message) {
       );
     }
   }
-
-  // Fear & Greed dla krypto
-  if (isCryptoQuery || has('sentyment','sentiment','fear','greed')) {
-    promises.push(getFearGreed().then(d => { if (d) parts.push(`Fear & Greed Index: ${d.value}/100 (${d.value_classification})`); }).catch(()=>{}));
+// SpaceX - IPO czerwiec 2026
+  if (has('spacex','spcx')) {
+    promises.push(
+      getStockPrice('SPCX').then(d => {
+        if (d) parts.push(`SpaceX (SPCX): $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`);
+        else parts.push(`SpaceX (SPCX): cena IPO $135 (debiut NYSE 12.06.2026) | wycena ~$1.77T | Starlink 10.3M subskrybentów [AURIMIQ KB]`);
+      }).catch(() => {
+        parts.push(`SpaceX (SPCX): cena IPO $135 (debiut NYSE 12.06.2026) | wycena ~$1.77T | Starlink 10.3M subskrybentów [AURIMIQ KB]`);
+      })
+    );
   }
 
   // ── AKCJE ─────────────────────────────────────────────────────
@@ -534,6 +540,12 @@ async function buildContext(message) {
 
 // ── System prompt ─────────────────────────────────────────────
 const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowych.
+
+‼️ AKTUALIZACJA RYNKOWA (czerwiec 2026):
+- SpaceX (ticker: SPCX) zadebiutowało na NYSE 12 czerwca 2026, cena IPO: $135/akcję
+- Wycena SpaceX przy IPO: ~$1.77 biliona dolarów
+- Starlink: 10.3 miliona subskrybentów
+- Akcje SPCX SĄ publicznie dostępne od czerwca 2026 — NIE twierdzić że są niedostępne
 
 ‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE Z BINANCE API" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance/AlphaVantage/ExchangeRate API. MUSISZ używać TYCH cen. Twoje dane treningowe są nieaktualne. Nigdy nie używaj cen z pamięci.
 
