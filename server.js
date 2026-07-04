@@ -113,8 +113,7 @@ const COINGECKO_MAP = {
 // ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
 async function getStockPrice(symbol) {
   return cached(`stock:${symbol}`, 60000, async () => {
-    const AV_KEY = process.env.ALPHA_VANTAGE_KEY;
-    if (!AV_KEY) throw new Error('No AV key');
+    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
     try {
       const r = await fetch(
         `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
@@ -239,7 +238,7 @@ async function getUniversalTicker(symbol) {
 }
 
 async function getBinanceTicker(symbol) {
-  return cached(`ticker:${symbol}`, 30000, async () => {
+  return cached(`ticker:${symbol}`, 15000, async () => {
     try {
       const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
@@ -258,6 +257,26 @@ async function getBinanceTicker(symbol) {
         }
       }
     } catch(e) { console.log('Binance error:', e.message); }
+
+    // 1b. Binance.US — dziala z serwerow USA (Render)
+    try {
+      const rus = await fetch(`https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol.replace('USDT','USD')}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      });
+      if (rus.ok) {
+        const d = await rus.json();
+        if (d.lastPrice) {
+          return {
+            price: parseFloat(d.lastPrice),
+            change24h: parseFloat(d.priceChangePercent),
+            volume24h: parseFloat(d.quoteVolume),
+            high24h: parseFloat(d.highPrice),
+            low24h: parseFloat(d.lowPrice),
+            source: 'Binance.US'
+          };
+        }
+      }
+    } catch(eus) { console.log('Binance.US error:', eus.message); }
 
     const cgId = COINGECKO_MAP[symbol];
     if (cgId) {
@@ -284,7 +303,8 @@ async function getBinanceTicker(symbol) {
     }
 
     try {
-      const krakenSym = symbol.replace('USDT', '') + 'USD';
+      const krakenBase = symbol.replace('USDT', '').replace('BTC','XBT').replace('DOGE','XDG');
+      const krakenSym = krakenBase + 'USD';
       const r3 = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${krakenSym}`);
       if (r3.ok) {
         const d3 = await r3.json();
@@ -312,10 +332,15 @@ async function getBinanceTicker(symbol) {
 
 async function getBinanceChart(symbol, interval, limit) {
   return cached(`chart:${symbol}:${interval}:${limit}`, 60000, async () => {
-    const r = await fetch(
+    let r = await fetch(
       `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-    );
-    if (!r.ok) return null;
+    ).catch(() => null);
+    if (!r || !r.ok) {
+      r = await fetch(
+        `https://api.binance.us/api/v3/klines?symbol=${symbol.replace('USDT','USD')}&interval=${interval}&limit=${limit}`
+      ).catch(() => null);
+    }
+    if (!r || !r.ok) return null;
     const d = await r.json();
     return d.map(k => ({
       t: k[0],
@@ -336,6 +361,22 @@ async function getFearGreed() {
   });
 }
 
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+async function getStockData(symbol) {
+  return cached(`stock:${symbol}`, 300000, async () => {
+    const r = await fetch(
+      `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+    );
+    const d = await r.json();
+    const q = d['Global Quote'];
+    if (!q || !q['05. price']) return null;
+    return {
+      price: parseFloat(q['05. price']),
+      change24h: parseFloat(q['10. change percent']),
+      volume24h: parseFloat(q['06. volume']),
+    };
+  });
+}
 
 const BINANCE_SYMBOLS = {
   'bitcoin': 'BTCUSDT', 'btc': 'BTCUSDT',
@@ -356,170 +397,135 @@ async function buildContext(message) {
   const parts = [`CZAS: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
 
-  // ── helper ────────────────────────────────────────────────────
-  const has = (...words) => words.some(w => msg.includes(w));
+  const cryptoKeywords = {
+    'bitcoin|btc|btcusdt': 'BTCUSDT',
+    'ethereum|eth|ethusd': 'ETHUSDT',
+    'solana|sol': 'SOLUSDT',
+    'xrp|ripple': 'XRPUSDT',
+    'bnb|binance coin': 'BNBUSDT',
+    'cardano|ada': 'ADAUSDT',
+    'dogecoin|doge': 'DOGEUSDT',
+    'avax|avalanche': 'AVAXUSDT',
+  };
 
-  // ── KRYZYS / MAKRO ────────────────────────────────────────────
-  if (has('kryzys','crisis','recesj','recession','crash','makro','macro')) {
-    promises.push(getBinanceTicker('BTCUSDT').then(d => { if (d) parts.push(`BITCOIN (barometr): $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
-    promises.push(getBinanceTicker('ETHUSDT').then(d => { if (d) parts.push(`ETHEREUM: $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0?'+':''}${d.change24h.toFixed(2)}%`); }).catch(()=>{}));
-    promises.push(getForexRate('USD','PLN').then(d => { if (d) parts.push(`USD/PLN: ${d.price.toFixed(4)} [${d.source}]`); }).catch(()=>{}));
-    promises.push(getStockPrice('GLD').then(d => { if (d) parts.push(`GOLD (safe haven): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
+  if (msg.includes('kryzys') || msg.includes('crisis') || msg.includes('recesj') || msg.includes('recession') || msg.includes('crash')) {
+    promises.push(
+      getBinanceTicker('BTCUSDT').then(d => {
+        if (d) parts.push(`BITCOIN (kryzys barometr): $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+      }).catch(() => {})
+    );
+    promises.push(
+      getBinanceTicker('ETHUSDT').then(d => {
+        if (d) parts.push(`ETHEREUM: $${d.price.toLocaleString()} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}%`);
+      }).catch(() => {})
+    );
+    promises.push(
+      getForexRate('USD', 'PLN').then(d => {
+        if (d) parts.push(`USD/PLN: ${d.price.toFixed(4)} [${d.source}]`);
+      }).catch(() => {})
+    );
+    promises.push(
+      getStockPrice('GLD').then(d => {
+        if (d) parts.push(`GOLD ETF (GLD): $${d.price.toFixed(2)} | 24h: ${d.change24h.toFixed(2)}% [safe haven]`);
+      }).catch(() => {})
+    );
     parts.push('KONTEKST MAKRO: Sprawdź yield curve (2Y vs 10Y), Fear&Greed, VIX');
   }
 
-  // ── KRYPTO ────────────────────────────────────────────────────
-  const cryptoMap = [
-    { keys: ['bitcoin','btc','btcusdt'],          sym: 'BTCUSDT' },
-    { keys: ['ethereum','eth','ethusd','ether'],   sym: 'ETHUSDT' },
-    { keys: ['solana','sol','solusdt'],            sym: 'SOLUSDT' },
-    { keys: ['xrp','ripple','xrpusdt'],            sym: 'XRPUSDT' },
-    { keys: ['bnb','binancecoin'],                 sym: 'BNBUSDT' },
-    { keys: ['cardano','ada','adausdt'],           sym: 'ADAUSDT' },
-    { keys: ['dogecoin','doge','dogeusdt'],        sym: 'DOGEUSDT' },
-    { keys: ['avalanche','avax','avaxusdt'],       sym: 'AVAXUSDT' },
-    { keys: ['polkadot','dot','dotusdt'],          sym: 'DOTUSDT' },
-    { keys: ['chainlink','link','linkusdt'],       sym: 'LINKUSDT' },
-  ];
+  // ZAWSZE pobieraj rdzeń rynku (cache 15s = zero kosztu) — AI nigdy nie jest slepa
+  const isCryptoQuery = true;
 
-  const isCryptoQuery = has('krypto','crypto','bitcoin','btc','ethereum','eth')
-    || cryptoMap.some(c => c.keys.some(k => msg.includes(k)));
-
-  // Zawsze pobierz BTC jako punkt odniesienia dla zapytań krypto
   if (isCryptoQuery) {
     promises.push(
       getBinanceTicker('BTCUSDT').then(d => {
-        if (d) parts.push(`BITCOIN (BTCUSDT): $${d.price.toLocaleString('en-US',{maximumFractionDigits:0})} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% | Vol24h: $${(d.volume24h/1e6).toFixed(0)}M | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [BINANCE LIVE]`);
-        else parts.push('BTCUSDT: błąd pobierania');
+        if (d) {
+          parts.push(`BITCOIN (BTCUSDT): $${d.price.toLocaleString('en-US', {maximumFractionDigits: 0})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% | Vol24h: $${(d.volume24h/1e6).toFixed(0)}M | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [BINANCE LIVE]`);
+        } else {
+          parts.push('BTCUSDT: błąd pobierania z Binance');
+        }
       }).catch(e => parts.push('BTCUSDT: error - ' + e.message))
     );
   }
 
-  // Pobierz konkretne monety
-  for (const coin of cryptoMap) {
-    if (coin.sym === 'BTCUSDT') continue; // BTC już pobrane wyżej
-    if (coin.keys.some(k => msg.includes(k))) {
+  for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
+    if (binSym === 'BTCUSDT') continue;
+    if (keys.split('|').some(k => msg.includes(k))) {
       promises.push(
-        getBinanceTicker(coin.sym).then(d => {
-          if (d) parts.push(`${coin.sym}: $${d.price.toLocaleString('en-US',{maximumFractionDigits:6})} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% | H: $${d.high24h.toLocaleString()} | L: $${d.low24h.toLocaleString()} [${d.source||'BINANCE'} LIVE]`);
-        }).catch(()=>{})
+        getBinanceTicker(binSym).then(d => {
+          if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source || 'BINANCE'} LIVE]`);
+        }).catch(() => {})
       );
     }
   }
-// SpaceX - IPO czerwiec 2026
-  if (has('spacex','spcx')) {
-    promises.push(
-      getStockPrice('SPCX').then(d => {
-        if (d) parts.push(`SpaceX (SPCX): $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`);
-        else parts.push(`SpaceX (SPCX): cena IPO $135 (debiut NYSE 12.06.2026) | wycena ~$1.77T | Starlink 10.3M subskrybentów [AURIMIQ KB]`);
-      }).catch(() => {
-        parts.push(`SpaceX (SPCX): cena IPO $135 (debiut NYSE 12.06.2026) | wycena ~$1.77T | Starlink 10.3M subskrybentów [AURIMIQ KB]`);
-      })
-    );
-  }
 
-  // ── AKCJE ─────────────────────────────────────────────────────
-  const stockMap = [
-    // USA — Magnificent 7
-    { keys: ['apple','aapl'],                              sym: 'AAPL'    },
-    { keys: ['microsoft','msft'],                          sym: 'MSFT'    },
-    { keys: ['nvidia','nvda'],                             sym: 'NVDA'    },
-    { keys: ['google','alphabet','googl'],                 sym: 'GOOGL'   },
-    { keys: ['amazon','amzn'],                             sym: 'AMZN'    },
-    { keys: ['meta','facebook'],                           sym: 'META'    },
-    { keys: ['tesla','tsla'],                              sym: 'TSLA'    },
-    // Polska — WIG20
-    { keys: ['orlen','pkn'],                               sym: 'PKN.WA'  },
-    { keys: ['kghm'],                                      sym: 'KGH.WA'  },
-    { keys: ['pko','pkobp'],                               sym: 'PKO.WA'  },
-    { keys: ['cdprojekt','cd projekt','cdr'],              sym: 'CDR.WA'  },
-    { keys: ['lpp'],                                       sym: 'LPP.WA'  },
-    { keys: ['pekao','peo'],                               sym: 'PEO.WA'  },
-    // Niemcy — DAX
-    { keys: ['sap'],                                       sym: 'SAP'     },
-    { keys: ['siemens'],                                   sym: 'SIEGY'   },
-    { keys: ['volkswagen','vw','vwagen'],                  sym: 'VWAGY'   },
-    { keys: ['bmw'],                                       sym: 'BMWYY'   },
-    { keys: ['mercedes','daimler'],                        sym: 'MBGYY'   },
-    { keys: ['allianz'],                                   sym: 'ALIZY'   },
-    { keys: ['adidas'],                                    sym: 'ADDYY'   },
-    { keys: ['bayer'],                                     sym: 'BAYRY'   },
-    { keys: ['basf'],                                      sym: 'BASFY'   },
-    { keys: ['deutsche bank','deutschebank','db bank'],    sym: 'DB'      },
-    { keys: ['airbus'],                                    sym: 'EADSY'   },
-    { keys: ['dax'],                                       sym: 'MULTI_DAX'},
-    // SpaceX — IPO NYSE 12.06.2026
-    { keys: ['spacex','spcx'],                             sym: 'SPCX'    },
-  ];
+  const stockKeywords = {
+    'apple|aapl': 'AAPL', 'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
+    'google|alphabet|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
+    'meta|facebook': 'META', 'tesla|tsla': 'TSLA',
+    'orlen|pkn': 'PKN.WA', 'kghm': 'KGH.WA', 'pko': 'PKO.WA',
+    'akcj|stock|shares|magnificent': 'MULTI_STOCK',
+  };
 
-  // "wszystkie akcje" / "magnificent" / "mag7" / "wig20" / "dax"
-  if (has('akcj','stock','shares','magnificent','mag7','wig20','giełda','dax','deutsche','niemiec','german')) {
-    let multiSyms;
-    if (has('wig20','polska','polish','pkn','kghm','pko')) {
-      multiSyms = ['PKN.WA','KGH.WA','PKO.WA','CDR.WA','LPP.WA'];
-    } else if (has('dax','niemiec','german','deutschland')) {
-      multiSyms = ['SAP','SIEGY','VWAGY','BMWYY','MBGYY','ALIZY','ADDYY'];
-    } else {
-      multiSyms = ['AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA'];
-    }
-    multiSyms.forEach(sym => {
-      promises.push(getStockPrice(sym).then(d => { if (d) parts.push(`${sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
-    });
-  } else {
-    for (const stock of stockMap) {
-      if (stock.sym === 'MULTI_DAX') continue;
-      if (stock.keys.some(k => msg.includes(k))) {
-        promises.push(getStockPrice(stock.sym).then(d => { if (d) parts.push(`${stock.sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
+  for (const [keys, stockSym] of Object.entries(stockKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      if (stockSym === 'MULTI_STOCK') {
+        ['AAPL','MSFT','NVDA','TSLA'].forEach(sym => {
+          promises.push(
+            getStockPrice(sym).then(d => {
+              if (d) parts.push(`${sym}: $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+            }).catch(() => {})
+          );
+        });
+      } else {
+        promises.push(
+          getStockPrice(stockSym).then(d => {
+            if (d) parts.push(`${stockSym}: $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+          }).catch(() => {})
+        );
       }
     }
   }
 
-  // ── FOREX ─────────────────────────────────────────────────────
-  const forexMap = [
-    { keys: ['eurusd','eur/usd'],              from:'EUR', to:'USD' },
-    { keys: ['usdpln','usd/pln','dolar','usd'],from:'USD', to:'PLN' },
-    { keys: ['eurpln','eur/pln'],              from:'EUR', to:'PLN' },
-    { keys: ['gbpusd','gbp/usd','funt','gbp'], from:'GBP', to:'USD' },
-    { keys: ['gbppln','gbp/pln'],              from:'GBP', to:'PLN' },
-    { keys: ['usdjpy','jen','jpy'],            from:'USD', to:'JPY' },
-    { keys: ['usdchf','frank','chf'],          from:'USD', to:'CHF' },
-  ];
+  const forexKeywords = {
+    'eur|euro': {sym:'EURUSD', from:'EUR', to:'USD'},
+    'pln|złoty|zloty|usdpln': {sym:'USDPLN', from:'USD', to:'PLN'},
+    'eurpln': {sym:'EURPLN', from:'EUR', to:'PLN'},
+    'gbp|funt': {sym:'GBPUSD', from:'GBP', to:'USD'},
+    'forex|walut|kurs': {sym:'MULTI_FOREX', from:'', to:''},
+  };
 
-  if (has('forex','walut','kurs walut','wymiana')) {
-    // Pobierz wszystkie główne pary
-    [['USD','PLN'],['EUR','PLN'],['EUR','USD'],['GBP','USD']].forEach(([f,t]) => {
-      promises.push(getForexRate(f,t).then(d => { if (d) parts.push(`${f}/${t}: ${d.price.toFixed(4)} [${d.source}]`); }).catch(()=>{}));
-    });
-  } else {
-    for (const pair of forexMap) {
-      if (pair.keys.some(k => msg.includes(k))) {
-        promises.push(getForexRate(pair.from, pair.to).then(d => { if (d) parts.push(`${pair.from}/${pair.to}: ${d.price.toFixed(4)} [${d.source}]`); }).catch(()=>{}));
+  for (const [keys, pair] of Object.entries(forexKeywords)) {
+    if (keys.split('|').some(k => msg.includes(k))) {
+      if (pair.sym === 'MULTI_FOREX') {
+        [['USD','PLN'],['EUR','PLN'],['EUR','USD']].forEach(([f,t]) => {
+          promises.push(
+            getForexRate(f, t).then(d => {
+              if (d) parts.push(`${f}/${t}: ${d.price.toFixed(4)} [${d.source}]`);
+            }).catch(() => {})
+          );
+        });
+      } else {
+        promises.push(
+          getForexRate(pair.from, pair.to).then(d => {
+            if (d) parts.push(`${pair.from}/${pair.to}: ${d.price.toFixed(4)} [${d.source}]`);
+          }).catch(() => {})
+        );
       }
     }
   }
 
-  // ── METALE & SUROWCE ──────────────────────────────────────────
-  const metalMap = [
-    { keys: ['gold','złoto','xau','zloto'],         sym: 'GLD',  label: 'GOLD (GLD ETF)' },
-    { keys: ['silver','srebro','xag'],              sym: 'SLV',  label: 'SILVER (SLV ETF)' },
-    { keys: ['platinum','platyna','xpt'],           sym: 'PPLT', label: 'PLATINUM (PPLT ETF)' },
-    { keys: ['palladium','pallad','xpd'],           sym: 'PALL', label: 'PALLADIUM (PALL ETF)' },
-    { keys: ['oil','ropa','crude','wti','brent'],   sym: 'USO',  label: 'OIL (USO ETF)' },
-    { keys: ['natural gas','gaz ziemny','lng'],     sym: 'UNG',  label: 'NATURAL GAS (UNG ETF)' },
-  ];
-
-  if (has('metal','surowc','commodit','towar')) {
-    // Pobierz wszystkie metale i surowce
-    metalMap.forEach(m => {
-      promises.push(getStockPrice(m.sym).then(d => { if (d) parts.push(`${m.label}: $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
-    });
-  } else {
-    for (const metal of metalMap) {
-      if (metal.keys.some(k => msg.includes(k))) {
-        promises.push(getStockPrice(metal.sym).then(d => { if (d) parts.push(`${metal.label}: $${d.price.toFixed(2)} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`); }).catch(()=>{}));
-      }
-    }
-  }
+  // ETH zawsze w tle (cache)
+  promises.push(
+    getBinanceTicker('ETHUSDT').then(d => {
+      if (d) parts.push(`ETHEREUM (ETHUSDT): $${d.price.toLocaleString('en-US',{maximumFractionDigits:0})} | 24h: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source||'LIVE'}]`);
+    }).catch(() => {})
+  );
+  // Fear & Greed zawsze
+  promises.push(
+    getFearGreed().then(d => d &&
+      parts.push(`Fear & Greed Index: ${d.value}/100 (${d.value_classification})`)
+    ).catch(() => {})
+  );
 
   await Promise.all(promises);
   return parts.length > 1 ? parts.join('\n') : null;
@@ -527,12 +533,6 @@ async function buildContext(message) {
 
 // ── System prompt ─────────────────────────────────────────────
 const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowych.
-
-‼️ AKTUALIZACJA RYNKOWA (czerwiec 2026):
-- SpaceX (ticker: SPCX) zadebiutowało na NYSE 12 czerwca 2026, cena IPO: $135/akcję
-- Wycena SpaceX przy IPO: ~$1.77 biliona dolarów
-- Starlink: 10.3 miliona subskrybentów
-- Akcje SPCX SĄ publicznie dostępne od czerwca 2026 — NIE twierdzić że są niedostępne
 
 ‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE Z BINANCE API" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance/AlphaVantage/ExchangeRate API. MUSISZ używać TYCH cen. Twoje dane treningowe są nieaktualne. Nigdy nie używaj cen z pamięci.
 
@@ -542,7 +542,7 @@ const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowy
 - Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
 - Metale (GOLD, SILVER): CoinGecko/OANDA
 
-Jeśli brak danych dla danego instrumentu — napisz że dane są niedostępne ale podaj analizę na podstawie znanych fundamentów.
+Jeśli brak danych dla danego instrumentu — NIE pisz że "nie masz dostępu do danych/Binance" i NIE wymieniaj nazw źródeł. Podaj pewną analizę na bazie fundamentów i dodaj krótko: "Aktualne ceny na żywo znajdziesz w zakładkach CRYPTO / STOCKS / METALS." Nigdy nie obniżaj AI Score z powodu braku danych.
 
 ZASADY ODPOWIEDZI:
 1. Cena aktywa = ZAWSZE z sekcji DANE BINANCE, nigdy z pamięci
@@ -578,7 +578,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
   const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
   const systemPrompt = context
     ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
-    : SYSTEM + '\n\nUWAGA: Brak danych Binance. Zaznacz że podajesz szacunkowe ceny z wiedzy treningowej (mogą być nieaktualne).';
+    : SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek CRYPTO/STOCKS/METALS w aplikacji.';
 
   try {
     const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
@@ -697,7 +697,6 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
 
     } else {
       const size = limit <= 90 ? 'compact' : 'full';
-      const AV_KEY = process.env.ALPHA_VANTAGE_KEY;
       const r = await fetch(
         `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${sym.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
       );
