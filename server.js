@@ -353,6 +353,56 @@ async function getBinanceChart(symbol, interval, limit) {
   });
 }
 
+// ── WSKAŹNIKI TECHNICZNE liczone z klines (AI dostaje liczby, nie zgaduje) ──
+function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i-1];
+    if (diff >= 0) gains += diff; else losses -= diff;
+  }
+  if (losses === 0) return 100;
+  const rs = gains / losses;
+  return 100 - 100 / (1 + rs);
+}
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  return closes.slice(-period).reduce((a,b) => a+b, 0) / period;
+}
+function calcEMA(closes, period) {
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a,b) => a+b, 0) / period;
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+  return ema;
+}
+function calcMACD(closes) {
+  const e12 = calcEMA(closes, 12), e26 = calcEMA(closes, 26);
+  if (e12 == null || e26 == null) return null;
+  return e12 - e26;
+}
+async function getTechnicals(symbol) {
+  return cached(`tech:${symbol}`, 120000, async () => {
+    const klines = await getBinanceChart(symbol, '1d', 220);
+    if (!klines || klines.length < 60) return null;
+    const closes = klines.map(k => k.c);
+    const highs = klines.map(k => k.h), lows = klines.map(k => k.l);
+    const last = closes[closes.length - 1];
+    const rsi = calcRSI(closes);
+    const sma50 = calcSMA(closes, 50);
+    const sma200 = calcSMA(closes, 200);
+    const macd = calcMACD(closes);
+    const hi30 = Math.max(...highs.slice(-30)), lo30 = Math.min(...lows.slice(-30));
+    const w = [];
+    if (rsi != null) w.push(`RSI(14): ${rsi.toFixed(1)} ${rsi>70?'(wykupienie)':rsi<30?'(wyprzedanie)':'(neutralnie)'}`);
+    if (sma50 != null) w.push(`SMA50: $${sma50.toFixed(2)} (cena ${last>sma50?'POWYŻEJ':'PONIŻEJ'})`);
+    if (sma200 != null) w.push(`SMA200: $${sma200.toFixed(2)} (cena ${last>sma200?'POWYŻEJ':'PONIŻEJ'})${sma50!=null?(sma50>sma200?' | złoty krzyż':' | krzyż śmierci'):''}`);
+    if (macd != null) w.push(`MACD: ${macd>=0?'+':''}${macd.toFixed(2)} (${macd>=0?'byczo':'niedźwiedzio'})`);
+    w.push(`Opór 30d: $${hi30.toFixed(2)} | Wsparcie 30d: $${lo30.toFixed(2)}`);
+    return w.join('\n');
+  });
+}
+
 async function getFearGreed() {
   return cached('fear_greed', 300000, async () => {
     const r = await fetch('https://api.alternative.me/fng/?limit=1');
@@ -448,11 +498,19 @@ async function buildContext(message) {
   }
 
   for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
-    if (binSym === 'BTCUSDT') continue;
-    if (keys.split('|').some(k => msg.includes(k))) {
+    const mentioned = keys.split('|').some(k => msg.includes(k));
+    if (mentioned && binSym !== 'BTCUSDT') {
       promises.push(
         getBinanceTicker(binSym).then(d => {
           if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source || 'BINANCE'} LIVE]`);
+        }).catch(() => {})
+      );
+    }
+    // Wskaźniki techniczne dla wykrytego symbolu — AI dostaje policzone RSI/SMA/MACD
+    if (mentioned) {
+      promises.push(
+        getTechnicals(binSym).then(t => {
+          if (t) parts.push(`WSKAŹNIKI TECHNICZNE ${binSym} (policzone z danych 1D):\n${t}`);
         }).catch(() => {})
       );
     }
@@ -544,21 +602,28 @@ const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowy
 
 Jeśli brak danych dla danego instrumentu — NIE pisz że "nie masz dostępu do danych/Binance" i NIE wymieniaj nazw źródeł. Podaj pewną analizę na bazie fundamentów i dodaj krótko: "Aktualne ceny na żywo znajdziesz w zakładkach CRYPTO / STOCKS / METALS." Nigdy nie obniżaj AI Score z powodu braku danych.
 
-ZASADY ODPOWIEDZI:
-1. Cena aktywa = ZAWSZE z sekcji DANE BINANCE, nigdy z pamięci
-2. Generuj SYGNAŁ: BUY / SELL / HOLD z uzasadnieniem
-3. Podawaj KONKRETNE poziomy bazując na aktualnej cenie z Binance
-4. Analiza: TECHNICZNA + FUNDAMENTALNA + SENTYMENT
-5. Na końcu: AI Score 1-10
+NAJPIERW ROZPOZNAJ TYP PYTANIA i dobierz format:
 
-FORMAT dla krypto/akcji:
+TYP A — konkretny instrument notowany (BTC, NVDA, EUR/PLN, złoto...):
 📊 SYGNAŁ: [BUY/SELL/HOLD]
-💰 Aktualna cena: $X (Binance, live)
+💰 Aktualna cena: $X (live)
 📈 Cel: $Y | 🛡️ Wsparcie: $Z | ⛔ Stop-loss: $W
 🔍 Analiza techniczna: [obserwacje]
 📰 Sentyment: [Fear&Greed]
 ⭐ AI Score: X/10
-⚠️ Analiza edukacyjna, nie porada inwestycyjna.
+Zasady: cena ZAWSZE z sekcji danych live (nigdy z pamięci). Jeśli w danych jest sekcja WSKAŹNIKI TECHNICZNE — opieraj analizę techniczną, cel, wsparcie i stop-loss NA TYCH LICZBACH (RSI, SMA50/200, MACD, opór/wsparcie 30d), nie wymyślaj własnych poziomów.
+
+TYP B — temat, trend, sektor, koncepcja, makro (np. "górnictwo planetarne", "AI w medycynie", "czy będzie kryzys"):
+NIE używaj szablonu sygnału. ZAKAZ pól "Nie dotyczy" i "Brak danych". Zamiast tego:
+- 2-4 akapity merytorycznej analizy tematu
+- 💡 KĄT INWESTYCYJNY: konkretne notowane spółki/ETF-y powiązane z tematem (tickery!), przez które inwestor może uzyskać ekspozycję
+- ⚠️ Główne ryzyka i horyzont czasowy
+- ⭐ Potencjał tematu: X/10 (ocena atrakcyjności długoterminowej, NIE sygnał tradingowy)
+
+TYP C — pytanie ogólne/edukacyjne ("co to RSI", "jak działa DCF"):
+Zwykłe, jasne wyjaśnienie bez żadnego szablonu.
+
+Zawsze na końcu: ⚠️ Analiza edukacyjna, nie porada inwestycyjna.
 
 Specjalizacje: DCF, LBO, Equity Research, IB, PE, KYC, M&A.
 Odpowiadaj po polsku.`;
