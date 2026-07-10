@@ -113,7 +113,40 @@ const COINGECKO_MAP = {
 // ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
 async function getStockPrice(symbol) {
   return cached(`stock:${symbol}`, 60000, async () => {
-    const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+    // ── STOOQ — polskie akcje GPW, WIG20, darmowe bez klucza ──
+const STOOQ_MAP = {
+  'PKN.WA':'pkn','KGH.WA':'kgh','PKO.WA':'pko','CDR.WA':'cdr','LPP.WA':'lpp',
+  'PEO.WA':'peo','PZU.WA':'pzu','ALE.WA':'ale','DNP.WA':'dnp','SPL.WA':'spl',
+  'KRU.WA':'kru','MBK.WA':'mbk','OPL.WA':'opl','CPS.WA':'cps','JSW.WA':'jsw',
+  'WIG20':'wig20','WIG':'wig',
+};
+async function getStooqQuote(symbol) {
+  return cached(`stooq:${symbol}`, 300000, async () => {
+    const stooqSym = STOOQ_MAP[symbol] || (symbol.endsWith('.WA') ? symbol.replace('.WA','').toLowerCase() : symbol.toLowerCase() + '.us');
+    const now = new Date();
+    const d2 = now.toISOString().slice(0,10).replace(/-/g,'');
+    const d1 = new Date(now - 10*864e5).toISOString().slice(0,10).replace(/-/g,'');
+    const r = await fetch(`https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    if (!r.ok) return null;
+    const csv = await r.text();
+    const rows = csv.trim().split('\n').slice(1).filter(x => x.includes(','));
+    if (rows.length < 2) return null;
+    const last = rows[rows.length-1].split(',');
+    const prev = rows[rows.length-2].split(',');
+    const close = parseFloat(last[4]), prevClose = parseFloat(prev[4]);
+    if (!isFinite(close) || !isFinite(prevClose)) return null;
+    return {
+      price: close,
+      change24h: ((close - prevClose) / prevClose) * 100,
+      volume24h: parseFloat(last[5]) || 0,
+      source: 'Stooq/GPW'
+    };
+  });
+}
+
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
     try {
       const r = await fetch(
         `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
@@ -414,17 +447,28 @@ async function getFearGreed() {
 const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
 async function getStockData(symbol) {
   return cached(`stock:${symbol}`, 300000, async () => {
-    const r = await fetch(
-      `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
-    );
-    const d = await r.json();
-    const q = d['Global Quote'];
-    if (!q || !q['05. price']) return null;
-    return {
-      price: parseFloat(q['05. price']),
-      change24h: parseFloat(q['10. change percent']),
-      volume24h: parseFloat(q['06. volume']),
-    };
+    // Polskie walory: Stooq jako źródło główne
+    if (symbol.endsWith('.WA') || symbol.startsWith('WIG')) {
+      const sq = await getStooqQuote(symbol).catch(() => null);
+      if (sq) return sq;
+    }
+    // USA: AlphaVantage, fallback Stooq
+    try {
+      const r = await fetch(
+        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+      );
+      const d = await r.json();
+      const q = d['Global Quote'];
+      if (q && q['05. price']) {
+        return {
+          price: parseFloat(q['05. price']),
+          change24h: parseFloat(q['10. change percent']),
+          volume24h: parseFloat(q['06. volume']),
+          source: 'AlphaVantage'
+        };
+      }
+    } catch(e) { console.log('AV error:', e.message); }
+    return await getStooqQuote(symbol).catch(() => null);
   });
 }
 
@@ -520,12 +564,30 @@ async function buildContext(message) {
     'apple|aapl': 'AAPL', 'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
     'google|alphabet|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
     'meta|facebook': 'META', 'tesla|tsla': 'TSLA',
-    'orlen|pkn': 'PKN.WA', 'kghm': 'KGH.WA', 'pko': 'PKO.WA',
+    'orlen|pkn': 'PKN.WA', 'kghm': 'KGH.WA', 'pko bp|pko bank': 'PKO.WA',
+    'cd projekt|cdprojekt|cdr': 'CDR.WA', 'lpp': 'LPP.WA', 'pekao': 'PEO.WA',
+    'pzu': 'PZU.WA', 'allegro': 'ALE.WA', 'dino': 'DNP.WA', 'jsw': 'JSW.WA',
+    'wig20|wig 20|gpw|giełd|gield': 'WIG20_SUMMARY',
     'akcj|stock|shares|magnificent': 'MULTI_STOCK',
   };
 
   for (const [keys, stockSym] of Object.entries(stockKeywords)) {
     if (keys.split('|').some(k => msg.includes(k))) {
+      if (stockSym === 'WIG20_SUMMARY') {
+        promises.push(
+          getStooqQuote('WIG20').then(d => {
+            if (d) parts.push(`INDEKS WIG20: ${d.price.toFixed(2)} pkt | dzień: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [Stooq/GPW LIVE]`);
+          }).catch(() => {})
+        );
+        ['PKN.WA','PKO.WA','PZU.WA','ALE.WA','CDR.WA'].forEach(sym => {
+          promises.push(
+            getStockData(sym).then(d => {
+              if (d) parts.push(`${sym}: ${d.price.toFixed(2)} PLN | dzień: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`);
+            }).catch(() => {})
+          );
+        });
+        continue;
+      }
       if (stockSym === 'MULTI_STOCK') {
         ['AAPL','MSFT','NVDA','TSLA'].forEach(sym => {
           promises.push(
