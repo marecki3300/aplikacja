@@ -120,15 +120,21 @@ const STOOQ_MAP = {
   'KRU.WA':'kru','MBK.WA':'mbk','OPL.WA':'opl','CPS.WA':'cps','JSW.WA':'jsw',
   'WIG20':'wig20','WIG':'wig',
 };
+function fetchWithTimeout(url, opts = {}, ms = 5000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
+}
+
 async function getStooqQuote(symbol) {
   return cached(`stooq:${symbol}`, 300000, async () => {
     const stooqSym = STOOQ_MAP[symbol] || (symbol.endsWith('.WA') ? symbol.replace('.WA','').toLowerCase() : symbol.toLowerCase() + '.us');
     const now = new Date();
     const d2 = now.toISOString().slice(0,10).replace(/-/g,'');
     const d1 = new Date(now - 10*864e5).toISOString().slice(0,10).replace(/-/g,'');
-    const r = await fetch(`https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`, {
+    const r = await fetchWithTimeout(`https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`, {
       headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
+    }, 5000);
     if (!r.ok) return null;
     const csv = await r.text();
     const rows = csv.trim().split('\n').slice(1).filter(x => x.includes(','));
@@ -647,7 +653,10 @@ async function buildContext(message) {
     ).catch(() => {})
   );
 
-  await Promise.all(promises);
+  await Promise.race([
+    Promise.all(promises),
+    new Promise(res => setTimeout(res, 8000))  // max 8s na dane — potem odpowiadamy tym co jest
+  ]);
   return parts.length > 1 ? parts.join('\n') : null;
 }
 
