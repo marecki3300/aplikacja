@@ -152,6 +152,32 @@ async function getStooqQuote(symbol) {
   });
 }
 
+// GPW summary — JEDNO zapytanie Stooq o wiele symboli naraz
+async function getGpwSummary() {
+  return cached('gpw:summary', 300000, async () => {
+    const syms = 'wig20 pkn pko pzu ale cdr';
+    const r = await fetchWithTimeout(
+      `https://stooq.com/q/l/?s=${encodeURIComponent(syms)}&f=sd2t2ohlcv&h&e=csv`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' } }, 5000
+    );
+    if (!r.ok) return null;
+    const csv = await r.text();
+    const rows = csv.trim().split('\n').slice(1);
+    const names = { WIG20:'INDEKS WIG20', PKN:'ORLEN (PKN)', PKO:'PKO BP', PZU:'PZU', ALE:'ALLEGRO', CDR:'CD PROJEKT' };
+    const out = [];
+    for (const row of rows) {
+      const c = row.split(',');
+      if (c.length < 8) continue;
+      const sym = c[0].toUpperCase(), open = parseFloat(c[3]), close = parseFloat(c[6]);
+      if (!isFinite(close)) continue;
+      const chg = isFinite(open) && open > 0 ? ((close - open) / open) * 100 : null;
+      const unit = sym === 'WIG20' ? 'pkt' : 'PLN';
+      out.push(`${names[sym] || sym}: ${close.toFixed(2)} ${unit}${chg!==null ? ` | od otwarcia: ${chg>=0?'+':''}${chg.toFixed(2)}%` : ''}`);
+    }
+    return out.length ? 'GPW (Stooq LIVE):\n' + out.join('\n') : null;
+  });
+}
+
 const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
     try {
       const r = await fetch(
@@ -580,18 +606,7 @@ async function buildContext(message) {
   for (const [keys, stockSym] of Object.entries(stockKeywords)) {
     if (keys.split('|').some(k => msg.includes(k))) {
       if (stockSym === 'WIG20_SUMMARY') {
-        promises.push(
-          getStooqQuote('WIG20').then(d => {
-            if (d) parts.push(`INDEKS WIG20: ${d.price.toFixed(2)} pkt | dzień: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [Stooq/GPW LIVE]`);
-          }).catch(() => {})
-        );
-        ['PKN.WA','PKO.WA','PZU.WA','ALE.WA','CDR.WA'].forEach(sym => {
-          promises.push(
-            getStockData(sym).then(d => {
-              if (d) parts.push(`${sym}: ${d.price.toFixed(2)} PLN | dzień: ${d.change24h>=0?'+':''}${d.change24h.toFixed(2)}% [${d.source}]`);
-            }).catch(() => {})
-          );
-        });
+        promises.push(getGpwSummary().then(t => { if (t) parts.push(t); }).catch(() => {}));
         continue;
       }
       if (stockSym === 'MULTI_STOCK') {
@@ -710,7 +725,12 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     .map(m => ({ role: m.role, content: m.content.slice(0, 3000) }));
 
   const lastMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
-  const context = await buildContext(lastMsg);
+  let context = null;
+  try {
+    context = await buildContext(lastMsg);
+  } catch (ctxErr) {
+    console.log('buildContext error (kontynuuję bez danych):', ctxErr.message);
+  }
   const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
   const systemPrompt = context
     ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
