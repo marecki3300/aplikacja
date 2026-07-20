@@ -764,8 +764,8 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 
   const safe = messages
     .filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-    .slice(-10)
-    .map(m => ({ role: m.role, content: m.content.slice(0, 3000) }));
+    .slice(-6)
+    .map(m => ({ role: m.role, content: m.content.slice(0, 2000) }));
 
   const lastMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
   let context = null;
@@ -779,11 +779,67 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
     : SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.';
 
+  // ── ROUTER INTELIGENCJI: głupoty → darmowy Groq, merytoryka → Claude ──
+  function classifyQuery(msg, hasContext) {
+    const m = (msg || '').toLowerCase();
+    // Twarde sygnały merytoryczne → CLAUDE
+    const serious = ['analiz','btc','bitcoin','eth','krypto','crypto','akcj','stock','kurs','cena','price',
+      'kupi','sprzeda','buy','sell','hold','portfel','portfolio','dcf','lbo','rsi','macd','wig','gpw',
+      'inwest','invest','zarob','earn','prognoz','forecast','trend','wsparc','opor','dolar','euro','jen',
+      'frank','funt','walut','forex','złot','gold','silver','srebr','ropa','oil','recesj','kryzys','crisis',
+      'wytłumacz','wyjaśnij','explain','erklär','analyse','aktie','währung'];
+    if (serious.some(k => m.includes(k))) return 'claude';
+    // Small talk / testy → GROQ
+    const trivial = ['cześć','czesc','hej','hello','hi ','siema','dzięki','dzieki','thanks','danke','hallo',
+      'kim jesteś','who are you','co umiesz','what can you','test','ok','dobra','super','fajnie'];
+    if (m.length < 15 || trivial.some(k => m === k || m.startsWith(k))) return 'groq';
+    // Szare — jeśli kontekst rynkowy się dokleił, traktuj poważnie
+    return hasContext ? 'claude' : 'gray';
+  }
+
+  async function askGroq(sysPrompt, msgs) {
+    try {
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          max_tokens: 1024,
+          temperature: 0.7,
+          messages: [{ role: 'system', content: sysPrompt }, ...msgs],
+        })
+      });
+      const d = await groqRes.json();
+      return d.error ? null : d.choices[0].message.content;
+    } catch(e) { return null; }
+  }
+
   try {
     const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
     let reply = null;
+    let usedModel = 'claude';
 
-    if (CLAUDE_KEY) {
+    let route = classifyQuery(lastMsg, !!context);
+    // Szare przypadki: Groq ocenia czy eskalować
+    if (route === 'gray') {
+      const probe = await askGroq(
+        'Oceń pytanie użytkownika. Jeśli wymaga poważnej analizy finansowej/inwestycyjnej z danymi, odpowiedz DOKŁADNIE jednym słowem: ESCALATE. W przeciwnym razie odpowiedz na nie normalnie, krótko i pomocnie, w języku pytania.',
+        safe
+      );
+      if (probe && probe.trim().toUpperCase() !== 'ESCALATE' && !probe.includes('ESCALATE')) {
+        reply = probe;
+        usedModel = 'groq-router';
+        console.log('Model: Groq (router — small talk)');
+      } else {
+        route = 'claude';
+      }
+    }
+    if (route === 'groq' && !reply) {
+      reply = await askGroq(systemPrompt, safe);
+      if (reply) { usedModel = 'groq-router'; console.log('Model: Groq (router — trivial)'); }
+    }
+
+    if (!reply && CLAUDE_KEY) {
       try {
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
@@ -794,7 +850,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
           },
           body: JSON.stringify({
             model: 'claude-sonnet-4-6',
-            max_tokens: 2000,
+            max_tokens: 1024,
             system: systemPrompt,
             messages: safe.map(m => ({ role: m.role, content: m.content })),
           })
@@ -813,23 +869,8 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     }
 
     if (!reply) {
-      try {
-        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-          body: JSON.stringify({
-            model: 'llama-3.3-70b-versatile',
-            max_tokens: 2000,
-            temperature: 0.7,
-            messages: [{ role: 'system', content: systemPrompt }, ...safe],
-          })
-        });
-        const groqData = await groqRes.json();
-        if (!groqData.error) {
-          reply = groqData.choices[0].message.content;
-          console.log('Model: Groq Llama 3.3 (fallback)');
-        }
-      } catch(e) {}
+      reply = await askGroq(systemPrompt, safe);
+      if (reply) { usedModel = 'groq-fallback'; console.log('Model: Groq Llama 3.3 (fallback)'); }
     }
 
     if (!reply) return res.status(502).json({ error: 'AI unavailable' });
@@ -839,7 +880,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
         user_id: req.user.id,
         user_message: lastMsg,
         ai_reply: reply,
-        model: 'claude-sonnet-4-6',
+        model: usedModel === 'claude' ? 'claude-sonnet-4-6' : usedModel,
       });
       await incQueries(req.user.id);
     } catch(e) {}
