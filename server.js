@@ -45,6 +45,13 @@ function auth(req, res, next) {
 // ── Plan check ────────────────────────────────────────────────
 const FREE_LIMIT = 1;
 const WELCOME_BONUS = 5;
+const PLAN_LIMITS = { free: FREE_LIMIT, lite: 25, pro: Infinity };
+function planLimit(plan) { return PLAN_LIMITS[plan] ?? FREE_LIMIT; }
+function calcRemaining(plan, queries, totalEver) {
+  if (plan === 'pro') return 999;
+  if (plan === 'free' && totalEver < WELCOME_BONUS) return WELCOME_BONUS - totalEver;
+  return Math.max(0, planLimit(plan) - queries);
+}
 
 async function checkPlan(req, res, next) {
   const { data } = await supabase
@@ -62,17 +69,16 @@ async function checkPlan(req, res, next) {
   req.queries = queries;
   req.totalEver = totalEver;
 
-  if (req.plan === 'free') {
-    // welcome bonus — pierwsze 5 zapytań w życiu
-    if (totalEver < WELCOME_BONUS) {
+  if (req.plan !== 'pro') {
+    // welcome bonus — pierwsze 5 zapytań w życiu (tylko free)
+    if (req.plan === 'free' && totalEver < WELCOME_BONUS) {
       return next();
     }
-    // potem 1 dziennie
-    if (queries >= FREE_LIMIT) {
+    if (queries >= planLimit(req.plan)) {
       return res.status(403).json({
         error: 'Daily limit reached',
         upgrade: true,
-        plan: 'free'
+        plan: req.plan
       });
     }
   }
@@ -150,6 +156,30 @@ async function getStooqQuote(symbol) {
       source: 'Stooq/GPW'
     };
   });
+}
+
+// ── KURSY WALUT NBP (oficjalne, darmowe) — dla wymieniających waluty ──
+async function getNbpRates() {
+  return cached('nbp:tableA', 600000, async () => {
+    const r = await fetchWithTimeout('https://api.nbp.pl/api/exchangerates/tables/A?format=json', {
+      headers: { 'Accept': 'application/json' }
+    }, 5000);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const rates = d?.[0]?.rates;
+    if (!Array.isArray(rates)) return null;
+    const pick = {};
+    for (const x of rates) pick[x.code] = x.mid;
+    return { date: d[0].effectiveDate, rates: pick };
+  });
+}
+function fmtFx(pick, codes) {
+  const out = [];
+  for (const c of codes) {
+    if (pick.rates[c]) out.push(`${c}/PLN: ${pick.rates[c].toFixed(4)} zł`);
+  }
+  if (pick.rates.EUR && pick.rates.USD) out.push(`EUR/USD: ${(pick.rates.EUR/pick.rates.USD).toFixed(4)}`);
+  return `KURSY NBP (średnie, ${pick.date}):\n` + out.join(' | ');
 }
 
 // GPW summary — JEDNO zapytanie Stooq o wiele symboli naraz
@@ -592,6 +622,16 @@ async function buildContext(message) {
     }
   }
 
+  // FOREX / waluty — NBP dla wymieniających waluty
+  const fxTriggers = ['jen','jpy','yen','dolar','usd','euro',' eur','frank','chf','funt','gbp','korona','nok','sek','czk','forint','huf','hrywna','uah','walut','forex','kantor','wymien','wymian'];
+  if (fxTriggers.some(k => msg.includes(k))) {
+    promises.push(
+      getNbpRates().then(d => {
+        if (d) parts.push(fmtFx(d, ['USD','EUR','CHF','GBP','JPY','NOK','SEK','CZK','UAH']));
+      }).catch(() => {})
+    );
+  }
+
   const stockKeywords = {
     'apple|aapl': 'AAPL', 'microsoft|msft': 'MSFT', 'nvidia|nvda': 'NVDA',
     'google|alphabet|googl': 'GOOGL', 'amazon|amzn': 'AMZN',
@@ -686,7 +726,7 @@ const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowy
 - Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
 - Metale (GOLD, SILVER): CoinGecko/OANDA
 
-Jeśli brak danych dla danego instrumentu — NIE pisz że "nie masz dostępu do danych/Binance" i NIE wymieniaj nazw źródeł. Podaj pewną analizę na bazie fundamentów i dodaj krótko: "Aktualne ceny na żywo znajdziesz w zakładkach CRYPTO / STOCKS / METALS." Nigdy nie obniżaj AI Score z powodu braku danych.
+Jeśli brak danych dla danego instrumentu — NIE pisz że "nie masz dostępu do danych/Binance" i NIE wymieniaj nazw źródeł. Podaj pewną analizę na bazie fundamentów i dodaj krótko: "Aktualne ceny na żywo znajdziesz w zakładkach aplikacji (CRYPTO, STOCKS, METALS)." Nigdy nie obniżaj AI Score z powodu braku danych.
 
 NAJPIERW ROZPOZNAJ TYP PYTANIA i dobierz format:
 
@@ -705,6 +745,9 @@ NIE używaj szablonu sygnału. ZAKAZ pól "Nie dotyczy" i "Brak danych". Zamiast
 - 💡 KĄT INWESTYCYJNY: konkretne notowane spółki/ETF-y powiązane z tematem (tickery!), przez które inwestor może uzyskać ekspozycję
 - ⚠️ Główne ryzyka i horyzont czasowy
 - ⭐ Potencjał tematu: X/10 (ocena atrakcyjności długoterminowej, NIE sygnał tradingowy)
+
+TYP A-FX — pytanie o kurs waluty (jen, dolar, euro, frank...):
+Jeśli w danych jest sekcja KURSY NBP — podaj kurs NBP, krótki komentarz i praktyczną wskazówkę dla wymieniającego (kantory online zwykle 1-2% od kursu średniego). NIE pisz że nie masz danych.
 
 TYP C — pytanie ogólne/edukacyjne ("co to RSI", "jak działa DCF"):
 Zwykłe, jasne wyjaśnienie bez żadnego szablonu.
@@ -734,7 +777,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
   const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
   const systemPrompt = context
     ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
-    : SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek CRYPTO/STOCKS/METALS w aplikacji.';
+    : SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.';
 
   try {
     const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
@@ -802,13 +845,9 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     } catch(e) {}
 
     const totalEver = req.totalEver || 0;
-    const remaining = req.plan === 'pro'
-      ? 999
-      : totalEver < WELCOME_BONUS
-        ? (WELCOME_BONUS - totalEver - 1)
-        : Math.max(0, FREE_LIMIT - req.queries - 1);
+    const remaining = calcRemaining(req.plan, req.queries + 1, (req.totalEver || 0) + 1);
 
-    res.json({ reply, plan: req.plan, remaining });
+    res.json({ reply, plan: req.plan, remaining, limit: req.plan === 'pro' ? 999 : planLimit(req.plan) });
 
   } catch(e) {
     res.status(502).json({ error: 'AI error: ' + e.message });
@@ -928,12 +967,8 @@ app.get('/api/profile', auth, async (req, res) => {
   const queries = data?.last_query_date?.slice(0, 10) === today ? (data.queries_today || 0) : 0;
   const plan = data?.plan || 'free';
   const totalEver = data?.total_queries_ever || 0;
-  const remaining = plan === 'pro'
-    ? 999
-    : totalEver < WELCOME_BONUS
-      ? (WELCOME_BONUS - totalEver)
-      : Math.max(0, FREE_LIMIT - queries);
-  res.json({ plan, queries_today: queries, total_queries_ever: totalEver, limit: plan === 'pro' ? 999 : FREE_LIMIT, remaining });
+  const remaining = calcRemaining(plan, queries, totalEver);
+  res.json({ plan, queries_today: queries, total_queries_ever: totalEver, limit: plan === 'pro' ? 999 : planLimit(plan), remaining });
 });
 
 // ── GET /api/history ──────────────────────────────────────────
@@ -951,13 +986,21 @@ app.get('/api/history', auth, async (req, res) => {
 // ── Stripe checkout ───────────────────────────────────────────
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
-    const { currency = 'pln' } = req.body;
+    const { currency = 'pln', plan = 'pro' } = req.body;
     const PRICES = {
-      pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',
-      usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
-      eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',
+      pro: {
+        pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',
+        usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
+        eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',
+      },
+      lite: {
+        pln: process.env.STRIPE_PRICE_LITE_PLN || 'BRAK_CENY_LITE_PLN',
+        usd: process.env.STRIPE_PRICE_LITE_USD || 'BRAK_CENY_LITE_USD',
+        eur: process.env.STRIPE_PRICE_LITE_EUR || 'BRAK_CENY_LITE_EUR',
+      },
     };
-    const priceId = PRICES[currency] || PRICES.pln;
+    const planKey = PRICES[plan] ? plan : 'pro';
+    const priceId = PRICES[planKey][currency] || PRICES[planKey].pln;
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'subscription',
@@ -966,7 +1009,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
       client_reference_id: req.user.id,
       success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
       cancel_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?cancelled=true',
-      metadata: { user_id: req.user.id }
+      metadata: { user_id: req.user.id, plan: planKey }
     });
     res.json({ url: session.url });
   } catch(e) {
@@ -985,7 +1028,8 @@ app.post('/api/webhook', async (req, res) => {
   if (event.type === 'checkout.session.completed') {
     const s = event.data.object;
     const uid = s.metadata?.user_id || s.client_reference_id;
-    if (uid) await supabase.from('profiles').upsert({ id: uid, plan: 'pro', stripe_customer_id: s.customer }, { onConflict: 'id' });
+    const purchasedPlan = ['lite','pro'].includes(s.metadata?.plan) ? s.metadata.plan : 'pro';
+    if (uid) await supabase.from('profiles').upsert({ id: uid, plan: purchasedPlan, stripe_customer_id: s.customer }, { onConflict: 'id' });
   }
   if (event.type === 'customer.subscription.deleted') {
     const { data } = await supabase.from('profiles').select('id').eq('stripe_customer_id', event.data.object.customer).single();
