@@ -1031,9 +1031,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     const STRIPE_LOCALE = { pl: 'pl', en: 'en', de: 'de' }[lang] || 'auto';
     const PRICES = {
       pro: {
-        pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',
-        usd: 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
-        eur: 'price_1TggkN2eFAwvdlMutK3MgMAF',
+        pln: process.env.STRIPE_PRICE_PRO_PLN || 'price_1Th6zS2eFAwvdlMu59DYdPui',
+        usd: process.env.STRIPE_PRICE_PRO_USD || 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
+        eur: process.env.STRIPE_PRICE_PRO_EUR || 'price_1TggkN2eFAwvdlMutK3MgMAF',
       },
       lite: {
         pln: process.env.STRIPE_PRICE_LITE_PLN || 'BRAK_CENY_LITE_PLN',
