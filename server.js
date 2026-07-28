@@ -1032,8 +1032,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     const PRICES = {
       pro: {
         pln: process.env.STRIPE_PRICE_PRO_PLN || 'price_1Th6zS2eFAwvdlMu59DYdPui',
-        usd: process.env.STRIPE_PRICE_PRO_USD || 'price_1Tggkj2eFAwvdlMuDMn9nVvY',
-        eur: process.env.STRIPE_PRICE_PRO_EUR || 'price_1TggkN2eFAwvdlMutK3MgMAF',
+        usd: process.env.STRIPE_PRICE_PRO_USD || 'price_1TyCim2eFAwvdlMueUlDiWvB',
+        eur: process.env.STRIPE_PRICE_PRO_EUR || 'price_1Txrl22eFAwvdlMuQDr5jk3D',
       },
       lite: {
         pln: process.env.STRIPE_PRICE_LITE_PLN || 'BRAK_CENY_LITE_PLN',
