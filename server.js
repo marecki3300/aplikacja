@@ -1027,7 +1027,8 @@ app.get('/api/history', auth, async (req, res) => {
 // ── Stripe checkout ───────────────────────────────────────────
 app.post('/api/create-checkout', auth, async (req, res) => {
   try {
-    const { currency = 'pln', plan = 'pro' } = req.body;
+    const { currency = 'pln', plan = 'pro', lang = 'pl' } = req.body;
+    const STRIPE_LOCALE = { pl: 'pl', en: 'en', de: 'de' }[lang] || 'auto';
     const PRICES = {
       pro: {
         pln: 'price_1Tg3My2eFAwvdlMuz94RQOHP',
@@ -1045,11 +1046,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'subscription',
+      locale: STRIPE_LOCALE,
       line_items: [{ price: priceId, quantity: 1 }],
       customer_email: req.user.email,
       client_reference_id: req.user.id,
-      success_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?upgraded=true',
-      cancel_url: (process.env.FRONTEND_URL || 'https://finansowa-aplikacja.netlify.app') + '?cancelled=true',
+      success_url: (process.env.FRONTEND_URL || 'https://aurimiq-ai.netlify.app') + '?upgraded=true',
+      cancel_url: (process.env.FRONTEND_URL || 'https://aurimiq-ai.netlify.app') + '?cancelled=true',
       metadata: { user_id: req.user.id, plan: planKey }
     });
     res.json({ url: session.url });
