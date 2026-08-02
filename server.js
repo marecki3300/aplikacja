@@ -116,10 +116,7 @@ const COINGECKO_MAP = {
   'LINKUSDT': 'chainlink',
 };
 
-// ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
-async function getStockPrice(symbol) {
-  return cached(`stock:${symbol}`, 60000, async () => {
-    // ── STOOQ — polskie akcje GPW, WIG20, darmowe bez klucza ──
+// ── STOOQ — polskie akcje GPW, WIG20, darmowe bez klucza ──
 const STOOQ_MAP = {
   'PKN.WA':'pkn','KGH.WA':'kgh','PKO.WA':'pko','CDR.WA':'cdr','LPP.WA':'lpp',
   'PEO.WA':'peo','PZU.WA':'pzu','ALE.WA':'ale','DNP.WA':'dnp','SPL.WA':'spl',
@@ -209,6 +206,10 @@ async function getGpwSummary() {
 }
 
 const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+
+// ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
+async function getStockPrice(symbol) {
+  return cached(`stock:${symbol}`, 60000, async () => {
     try {
       const r = await fetch(
         `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
@@ -506,7 +507,6 @@ async function getFearGreed() {
   });
 }
 
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
 async function getStockData(symbol) {
   return cached(`stock:${symbol}`, 300000, async () => {
     // Polskie walory: Stooq jako źródło główne
@@ -768,19 +768,9 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     .map(m => ({ role: m.role, content: m.content.slice(0, 2000) }));
 
   const lastMsg = safe.filter(m => m.role === 'user').pop()?.content || '';
-  let context = null;
-  try {
-    context = await buildContext(lastMsg);
-  } catch (ctxErr) {
-    console.log('buildContext error (kontynuuję bez danych):', ctxErr.message);
-  }
-  const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
-  const systemPrompt = context
-    ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
-    : SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.';
 
-  // ── ROUTER INTELIGENCJI: głupoty → darmowy Groq, merytoryka → Claude ──
-  function classifyQuery(msg, hasContext) {
+  // ── ROUTER INTELIGENCJI: klasyfikacja NAJPIERW (tanio, tekstowo) ──
+  function classifyQuery(msg) {
     const m = (msg || '').toLowerCase();
     // Twarde sygnały merytoryczne → CLAUDE
     const serious = ['analiz','btc','bitcoin','eth','krypto','crypto','akcj','stock','kurs','cena','price',
@@ -793,8 +783,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     const trivial = ['cześć','czesc','hej','hello','hi ','siema','dzięki','dzieki','thanks','danke','hallo',
       'kim jesteś','who are you','co umiesz','what can you','test','ok','dobra','super','fajnie'];
     if (m.length < 15 || trivial.some(k => m === k || m.startsWith(k))) return 'groq';
-    // Szare — jeśli kontekst rynkowy się dokleił, traktuj poważnie
-    return hasContext ? 'claude' : 'gray';
+    return 'gray';
   }
 
   async function askGroq(sysPrompt, msgs) {
@@ -814,13 +803,17 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     } catch(e) { return null; }
   }
 
+  // Prosty system prompt bez danych rynkowych — dla Groq (trivial/probe)
+  const BASE_SYSTEM = SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.';
+
   try {
     const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
     let reply = null;
     let usedModel = 'claude';
 
-    let route = classifyQuery(lastMsg, !!context);
-    // Szare przypadki: Groq ocenia czy eskalować
+    let route = classifyQuery(lastMsg);
+
+    // Szare przypadki: Groq ocenia czy eskalować — BEZ czekania na dane rynkowe
     if (route === 'gray') {
       const probe = await askGroq(
         'Oceń pytanie użytkownika. Jeśli wymaga poważnej analizy finansowej/inwestycyjnej z danymi, odpowiedz DOKŁADNIE jednym słowem: ESCALATE. W przeciwnym razie odpowiedz na nie normalnie, krótko i pomocnie, w języku pytania.',
@@ -834,43 +827,58 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
         route = 'claude';
       }
     }
+
     if (route === 'groq' && !reply) {
-      reply = await askGroq(systemPrompt, safe);
+      reply = await askGroq(BASE_SYSTEM, safe);
       if (reply) { usedModel = 'groq-router'; console.log('Model: Groq (router — trivial)'); }
     }
 
-    if (!reply && CLAUDE_KEY) {
+    // Dane rynkowe pobieramy TYLKO gdy faktycznie idziemy do Claude
+    if (route === 'claude' && !reply) {
+      let context = null;
       try {
-        const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': CLAUDE_KEY,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 1024,
-            system: systemPrompt,
-            messages: safe.map(m => ({ role: m.role, content: m.content })),
-          })
-        });
-
-        const claudeData = await claudeRes.json();
-        if (claudeData.content?.[0]?.text) {
-          reply = claudeData.content[0].text;
-          console.log('Model: Claude Sonnet 4.6');
-        } else {
-          console.log('Claude error:', JSON.stringify(claudeData).slice(0, 200));
-        }
-      } catch(e) {
-        console.log('Claude failed:', e.message);
+        context = await buildContext(lastMsg);
+      } catch (ctxErr) {
+        console.log('buildContext error (kontynuuję bez danych):', ctxErr.message);
       }
-    }
+      const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
+      const systemPrompt = context
+        ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
+        : BASE_SYSTEM;
 
-    if (!reply) {
-      reply = await askGroq(systemPrompt, safe);
-      if (reply) { usedModel = 'groq-fallback'; console.log('Model: Groq Llama 3.3 (fallback)'); }
+      if (CLAUDE_KEY) {
+        try {
+          const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': CLAUDE_KEY,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-6',
+              max_tokens: 1024,
+              system: systemPrompt,
+              messages: safe.map(m => ({ role: m.role, content: m.content })),
+            })
+          });
+
+          const claudeData = await claudeRes.json();
+          if (claudeData.content?.[0]?.text) {
+            reply = claudeData.content[0].text;
+            console.log('Model: Claude Sonnet 4.6');
+          } else {
+            console.log('Claude error:', JSON.stringify(claudeData).slice(0, 200));
+          }
+        } catch(e) {
+          console.log('Claude failed:', e.message);
+        }
+      }
+
+      if (!reply) {
+        reply = await askGroq(systemPrompt, safe);
+        if (reply) { usedModel = 'groq-fallback'; console.log('Model: Groq Llama 3.3 (fallback)'); }
+      }
     }
 
     if (!reply) return res.status(502).json({ error: 'AI unavailable' });
