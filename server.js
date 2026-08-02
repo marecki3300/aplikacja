@@ -757,9 +757,19 @@ Zawsze na końcu: ⚠️ Analiza edukacyjna, nie porada inwestycyjna.
 Specjalizacje: DCF, LBO, Equity Research, IB, PE, KYC, M&A.
 Odpowiadaj po polsku.`;
 
+// ── Wielojęzyczność — nadpisuje domyślne "Odpowiadaj po polsku." ──
+const LANG_NOTE = {
+  en: 'IMPORTANT — LANGUAGE OVERRIDE: Ignore the "Odpowiadaj po polsku" instruction above. Respond entirely in English. Translate all section labels and headers into English (e.g. "SYGNAŁ" -> "SIGNAL", "Aktualna cena" -> "Current price", "Cel" -> "Target", "Wsparcie" -> "Support", "Analiza techniczna" -> "Technical analysis", "Sentyment" -> "Sentiment"). Do not mix Polish and English.',
+  de: 'WICHTIG — SPRACHÜBERSCHREIBUNG: Ignoriere die Anweisung "Odpowiadaj po polsku" oben. Antworte vollständig auf Deutsch. Übersetze alle Abschnittsbezeichnungen und Überschriften ins Deutsche (z.B. "SYGNAŁ" -> "SIGNAL", "Aktualna cena" -> "Aktueller Preis", "Cel" -> "Kursziel", "Wsparcie" -> "Unterstützung", "Analiza techniczna" -> "Technische Analyse", "Sentyment" -> "Stimmung"). Mische nicht Polnisch und Deutsch.',
+};
+function withLang(systemText, lang) {
+  return LANG_NOTE[lang] ? systemText + '\n\n' + LANG_NOTE[lang] : systemText;
+}
+
 // ── POST /api/chat ────────────────────────────────────────────
 app.post('/api/chat', auth, checkPlan, async (req, res) => {
-  const { messages } = req.body;
+  const { messages, lang: rawLang } = req.body;
+  const lang = ['pl', 'en', 'de'].includes(rawLang) ? rawLang : 'pl';
   if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'No messages' });
 
   const safe = messages
@@ -804,7 +814,10 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
   }
 
   // Prosty system prompt bez danych rynkowych — dla Groq (trivial/probe)
-  const BASE_SYSTEM = SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.';
+  const BASE_SYSTEM = withLang(
+    SYSTEM + '\n\nUWAGA: Sekcja danych live jest dzis pusta. Odpowiadaj merytorycznie i pewnie na bazie wiedzy ogolnej. NIE wspominaj o braku dostepu do zadnych zrodel (Binance itp.) ani nie obnizaj AI Score z tego powodu. Zamiast konkretnych cen odsylaj do zakladek aplikacji (CRYPTO, STOCKS, METALS). NIE odsylaj do zakladki FOREX — taka zakladka nie istnieje w aplikacji mobilnej.',
+    lang
+  );
 
   try {
     const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
@@ -843,7 +856,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
       }
       const now = new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' });
       const systemPrompt = context
-        ? SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.'
+        ? withLang(SYSTEM + '\n\n‼️ DANE Z BINANCE API (pobrane ' + now + ') — UŻYJ TYCH CEN:\n' + context + '\n‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.', lang)
         : BASE_SYSTEM;
 
       if (CLAUDE_KEY) {
