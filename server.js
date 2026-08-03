@@ -918,22 +918,16 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 
     let route = classifyQuery(lastMsg);
 
-    // Szare przypadki: Groq ocenia czy eskalować — BEZ czekania na dane rynkowe
+    // Szare przypadki → prosto do Claude.
+    //
+    // Wcześniej leciała tu dodatkowa sonda do Groq ("ESCALATE albo odpowiedz
+    // sam"), która przy każdym niejednoznacznym pytaniu dokładała jedno pełne
+    // okrążenie sieciowe przed właściwą odpowiedzią, a część pytań kończyła na
+    // llamie zamiast na Claude. To był główny powód spadku prędkości i precyzji
+    // względem wersji 1.11. Small talk i tak łapie classifyQuery (lista
+    // `trivial` + próg 15 znaków), więc sonda nie wnosiła nic poza opóźnieniem.
     if (route === 'gray') {
-      const probeLangNote = lang === 'en' ? ' Respond only in English.'
-        : lang === 'de' ? ' Antworte nur auf Deutsch.'
-        : ' Odpowiadaj tylko po polsku.';
-      const probe = await askGroq(
-        'Oceń pytanie użytkownika. Jeśli wymaga poważnej analizy finansowej/inwestycyjnej z danymi, odpowiedz DOKŁADNIE jednym słowem: ESCALATE. W przeciwnym razie odpowiedz na nie normalnie, krótko i pomocnie.' + probeLangNote,
-        safe
-      );
-      if (probe && probe.trim().toUpperCase() !== 'ESCALATE' && !probe.includes('ESCALATE')) {
-        reply = probe;
-        usedModel = 'groq-router';
-        console.log('Model: Groq (router — small talk)');
-      } else {
-        route = 'claude';
-      }
+      route = 'claude';
     }
 
     if (route === 'groq' && !reply) {
