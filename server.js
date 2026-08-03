@@ -7,6 +7,7 @@ import cors from 'cors';
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 import Stripe from 'stripe';
+import { google } from 'googleapis';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1187,6 +1188,163 @@ app.post('/api/webhook', async (req, res) => {
   if (event.type === 'customer.subscription.deleted') {
     const { data } = await supabase.from('profiles').select('id').eq('stripe_customer_id', event.data.object.customer).single();
     if (data) await supabase.from('profiles').update({ plan: 'free' }).eq('id', data.id);
+  }
+  res.json({ received: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// GOOGLE PLAY BILLING
+//
+// Stripe zostaje dla terminala webowego. Aplikacja z Google Play
+// MUSI rozliczac sie przez Play Billing — sprzedaz tresci cyfrowych
+// z linkiem na zewnatrz lamie Payments policy i konczy sie odrzuceniem.
+//
+// Zrodlem prawdy pozostaje profiles.plan, dokladnie jak przy Stripe.
+// ══════════════════════════════════════════════════════════════
+
+const PLAY_PACKAGE = process.env.PLAY_PACKAGE_NAME || 'com.aurimiq';
+
+// productId w Play Console  →  nazwa planu w profiles.plan
+const PLAY_PRODUCTS = {
+  'aurimiq_lite': 'lite',
+  'aurimiq_pro': 'pro',
+};
+
+// Stany, w ktorych subskrypcja daje dostep. Grace period celowo liczy sie
+// jako aktywny — uzytkownikowi odmowila karta, ale Google wciaz probuje
+// pobrac oplate i odcinanie go w tym momencie to najprostsza droga do
+// jednogwiazdkowej recenzji.
+const PLAY_ACTIVE_STATES = new Set([
+  'SUBSCRIPTION_STATE_ACTIVE',
+  'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+]);
+
+let playClientCache = null;
+function getPlayClient() {
+  if (playClientCache) return playClientCache;
+  const raw = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(raw),
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+    playClientCache = google.androidpublisher({ version: 'v3', auth });
+    return playClientCache;
+  } catch (e) {
+    console.error('PLAY: zly GOOGLE_PLAY_SERVICE_ACCOUNT:', e.message);
+    return null;
+  }
+}
+
+// Pyta Google o stan subskrypcji. Nigdy nie ufamy temu, co przyslala apka —
+// purchaseToken z klienta jest tylko wskaznikiem, prawde mowi androidpublisher.
+async function fetchPlaySubscription(purchaseToken) {
+  const client = getPlayClient();
+  if (!client) throw new Error('Play service account not configured');
+  const { data } = await client.purchases.subscriptionsv2.get({
+    packageName: PLAY_PACKAGE,
+    token: purchaseToken,
+  });
+  return data;
+}
+
+function planFromPlaySubscription(sub) {
+  if (!sub || !PLAY_ACTIVE_STATES.has(sub.subscriptionState)) return 'free';
+  // Przy zmianie planu (upgrade lite→pro) Google dopisuje nowy lineItem
+  // na koniec listy, wiec bierzemy ostatni.
+  const items = sub.lineItems || [];
+  const productId = items[items.length - 1]?.productId;
+  return PLAY_PRODUCTS[productId] || 'free';
+}
+
+// Brak potwierdzenia w ciagu 3 dni = Google automatycznie zwraca pieniadze.
+// Klient tez to robi przez finishTransaction, ale jesli apka zginie miedzy
+// zakupem a potwierdzeniem, uzytkownik traci plan bez powodu.
+async function acknowledgePlayPurchase(productId, purchaseToken) {
+  const client = getPlayClient();
+  if (!client) return;
+  try {
+    await client.purchases.subscriptions.acknowledge({
+      packageName: PLAY_PACKAGE,
+      subscriptionId: productId,
+      token: purchaseToken,
+      requestBody: {},
+    });
+  } catch (e) {
+    // 400 "already acknowledged" jest normalny — klient zdazyl pierwszy.
+    if (!String(e.message).includes('already been acknowledged')) {
+      console.error('PLAY acknowledge error:', e.message);
+    }
+  }
+}
+
+async function applyPlayPurchase(userId, purchaseToken) {
+  const sub = await fetchPlaySubscription(purchaseToken);
+  const plan = planFromPlaySubscription(sub);
+  const items = sub.lineItems || [];
+  const productId = items[items.length - 1]?.productId;
+
+  if (plan !== 'free' && productId) {
+    await acknowledgePlayPurchase(productId, purchaseToken);
+  }
+
+  await supabase.from('profiles').upsert(
+    { id: userId, plan, play_purchase_token: purchaseToken },
+    { onConflict: 'id' }
+  );
+
+  return { plan, state: sub.subscriptionState, expiryTime: sub.lineItems?.[items.length - 1]?.expiryTime };
+}
+
+// ── POST /api/play/verify — wolane przez apke zaraz po zakupie ──
+app.post('/api/play/verify', auth, async (req, res) => {
+  const { purchaseToken } = req.body || {};
+  if (!purchaseToken || typeof purchaseToken !== 'string') {
+    return res.status(400).json({ error: 'No purchaseToken' });
+  }
+  try {
+    const result = await applyPlayPurchase(req.user.id, purchaseToken);
+    console.log(`PLAY verify: user=${req.user.id} plan=${result.plan} state=${result.state}`);
+    res.json(result);
+  } catch (e) {
+    console.error('PLAY verify error:', e.message);
+    res.status(502).json({ error: 'Play verification failed' });
+  }
+});
+
+// ── POST /api/play/rtdn — Real-time Developer Notifications ────
+//
+// Pub/Sub push. Bez tego odnowienia, anulowania i zwroty nigdy nie
+// dotarlyby do bazy — apka wola /verify tylko raz, w chwili zakupu,
+// a subskrypcja zyje miesiacami.
+//
+// Zawsze odpowiadamy 200: kazdy inny kod kaze Pub/Sub ponawiac
+// wiadomosc w kolko, a bledny token nie naprawi sie od powtarzania.
+app.post('/api/play/rtdn', async (req, res) => {
+  try {
+    const encoded = req.body?.message?.data;
+    if (!encoded) return res.json({ received: true });
+
+    const payload = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+    const note = payload.subscriptionNotification;
+    if (!note?.purchaseToken) return res.json({ received: true });
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('play_purchase_token', note.purchaseToken)
+      .single();
+
+    if (!profile) {
+      console.log('PLAY rtdn: nieznany token, pomijam');
+      return res.json({ received: true });
+    }
+
+    const result = await applyPlayPurchase(profile.id, note.purchaseToken);
+    console.log(`PLAY rtdn: type=${note.notificationType} user=${profile.id} plan=${result.plan}`);
+  } catch (e) {
+    console.error('PLAY rtdn error:', e.message);
   }
   res.json({ received: true });
 });
