@@ -1327,8 +1327,20 @@ app.post('/api/play/rtdn', async (req, res) => {
     if (!encoded) return res.json({ received: true });
 
     const payload = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+
+    // "Send test notification" z Play Console przysyla testNotification,
+    // nie subscriptionNotification. Bez tego logu test wyglada jak cisza,
+    // mimo ze caly lancuch Play → Pub/Sub → backend dziala poprawnie.
+    if (payload.testNotification) {
+      console.log('PLAY rtdn: TEST OK — polaczenie z Play dziala, pakiet=' + payload.packageName);
+      return res.json({ received: true });
+    }
+
     const note = payload.subscriptionNotification;
-    if (!note?.purchaseToken) return res.json({ received: true });
+    if (!note?.purchaseToken) {
+      console.log('PLAY rtdn: pominieto, brak subscriptionNotification — ' + JSON.stringify(payload).slice(0, 200));
+      return res.json({ received: true });
+    }
 
     const { data: profile } = await supabase
       .from('profiles')
