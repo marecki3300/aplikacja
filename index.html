@@ -63,7 +63,9 @@ header{position:sticky;top:0;z-index:100;background:rgba(6,10,20,.95);backdrop-f
 
 /* CHART PANEL */
 .chart-panel{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.chart-toolbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:8px 12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+/* Pasek symboli zawija sie i przewija — przy kilkudziesieciu instrumentach
+   bez limitu wysokosci zepchnalby wykres poza ekran. */
+.chart-toolbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:8px 12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;max-height:104px;overflow-y:auto}
 .sym-display{font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;color:var(--white);min-width:90px}
 .sbtn{background:transparent;border:1px solid var(--border);color:var(--text2);font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1px;padding:4px 10px;cursor:pointer;transition:all .15s}
 .sbtn:hover,.sbtn.active{border-color:var(--blue);color:var(--blue);background:rgba(0,136,255,.06)}
@@ -251,10 +253,44 @@ textarea::placeholder{color:var(--text3)}
       <button class="sbtn" onclick="changeSym('SOLUSDT',this)">SOL</button>
       <button class="sbtn" onclick="changeSym('XRPUSDT',this)">XRP</button>
       <button class="sbtn" onclick="changeSym('BNBUSDT',this)">BNB</button>
-      <button class="sbtn" onclick="changeSym('XAUUSD',this)">GOLD</button>
+      <button class="sbtn" onclick="changeSym('ADAUSDT',this)">ADA</button>
+      <button class="sbtn" onclick="changeSym('DOGEUSDT',this)">DOGE</button>
+      <button class="sbtn" onclick="changeSym('AVAXUSDT',this)">AVAX</button>
+      <button class="sbtn" onclick="changeSym('DOTUSDT',this)">DOT</button>
+      <button class="sbtn" onclick="changeSym('LINKUSDT',this)">LINK</button>
+      <div class="divv"></div>
       <button class="sbtn" onclick="changeSym('AAPL',this)">AAPL</button>
+      <button class="sbtn" onclick="changeSym('MSFT',this)">MSFT</button>
       <button class="sbtn" onclick="changeSym('NVDA',this)">NVDA</button>
+      <button class="sbtn" onclick="changeSym('GOOGL',this)">GOOGL</button>
+      <button class="sbtn" onclick="changeSym('AMZN',this)">AMZN</button>
+      <button class="sbtn" onclick="changeSym('META',this)">META</button>
       <button class="sbtn" onclick="changeSym('TSLA',this)">TSLA</button>
+      <div class="divv"></div>
+      <button class="sbtn" onclick="changeSym('GPW:PKN',this)">PKN</button>
+      <button class="sbtn" onclick="changeSym('GPW:KGH',this)">KGHM</button>
+      <button class="sbtn" onclick="changeSym('GPW:PKO',this)">PKO</button>
+      <button class="sbtn" onclick="changeSym('GPW:PEO',this)">PEO</button>
+      <button class="sbtn" onclick="changeSym('GPW:PZU',this)">PZU</button>
+      <button class="sbtn" onclick="changeSym('GPW:CDR',this)">CDR</button>
+      <button class="sbtn" onclick="changeSym('GPW:ALE',this)">ALE</button>
+      <button class="sbtn" onclick="changeSym('GPW:DNP',this)">DINO</button>
+      <div class="divv"></div>
+      <button class="sbtn" onclick="changeSym('XETR:SAP',this)">SAP</button>
+      <button class="sbtn" onclick="changeSym('XETR:SIE',this)">SIE</button>
+      <button class="sbtn" onclick="changeSym('XETR:ALV',this)">ALV</button>
+      <button class="sbtn" onclick="changeSym('XETR:BMW',this)">BMW</button>
+      <button class="sbtn" onclick="changeSym('XETR:VOW3',this)">VOW3</button>
+      <button class="sbtn" onclick="changeSym('XETR:BAS',this)">BASF</button>
+      <div class="divv"></div>
+      <button class="sbtn" onclick="changeSym('XAUUSD',this)">GOLD</button>
+      <button class="sbtn" onclick="changeSym('XAGUSD',this)">SILVER</button>
+      <button class="sbtn" onclick="changeSym('XPTUSD',this)">PLAT</button>
+      <button class="sbtn" onclick="changeSym('XPDUSD',this)">PALL</button>
+      <button class="sbtn" onclick="changeSym('TVC:USOIL',this)">WTI</button>
+      <button class="sbtn" onclick="changeSym('TVC:UKOIL',this)">BRENT</button>
+      <button class="sbtn" onclick="changeSym('TVC:NGAS',this)">GAS</button>
+      <button class="sbtn" onclick="changeSym('COMEX:HG1!',this)">COPPER</button>
       <div class="divv"></div>
       <button class="intbtn active" onclick="changeInt('D',this)">1D</button>
       <button class="intbtn" onclick="changeInt('W',this)">1W</button>

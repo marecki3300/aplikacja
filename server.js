@@ -102,11 +102,19 @@ async function incQueries(userId) {
 
 // Cache 60 sekund
 const cache = new Map();
+// Trzymamy obietnice, nie wynik. Dzieki temu dwa rownolegle zapytania o ten
+// sam klucz dziela jedno okraženie sieciowe zamiast strzelac dwa razy —
+// wczesniej przy pytaniu o kryzys BTC leciał do Binance dwukrotnie, bo zaden
+// z wywolan nie zdazyl jeszcze zapisac wyniku.
 function cached(key, ttl, fn) {
   const now = Date.now();
   const hit = cache.get(key);
-  if (hit && now - hit.ts < ttl) return Promise.resolve(hit.data);
-  return fn().then(data => { cache.set(key, { data, ts: now }); return data; });
+  if (hit && now - hit.ts < ttl) return hit.p;
+  // Bledu nie zapamietujemy — inaczej jedna chwilowa awaria zrodla
+  // blokowalaby dane na caly TTL.
+  const p = fn().catch(err => { cache.delete(key); throw err; });
+  cache.set(key, { p, ts: now });
+  return p;
 }
 
 // Binance ticker — cena + zmiana 24h (z fallback na CoinGecko)
@@ -124,6 +132,23 @@ const STOOQ_MAP = {
   'KRU.WA':'kru','MBK.WA':'mbk','OPL.WA':'opl','CPS.WA':'cps','JSW.WA':'jsw',
   'WIG20':'wig20','WIG':'wig',
 };
+// ── SUROWCE ──────────────────────────────────────────────────
+//
+// Alpha Vantage nie serwuje symboli spot ani kontraktow towarowych, wiec
+// probujemy najpierw Stooqa (prawdziwe ceny surowca), a gdy odmowi — ETF-u,
+// ktory sledzi ten sam instrument. ETF pokazuje inna wartosc bezwzgledna niz
+// surowiec, dlatego jest wylacznie awaryjny i oznaczamy go w odpowiedzi.
+const COMMODITY_SOURCES = {
+  XAUUSD: { stooq: 'xauusd', etf: 'GLD',  name: 'Gold'         },
+  XAGUSD: { stooq: 'xagusd', etf: 'SLV',  name: 'Silver'       },
+  XPTUSD: { stooq: 'xptusd', etf: 'PPLT', name: 'Platinum'     },
+  XPDUSD: { stooq: 'xpdusd', etf: 'PALL', name: 'Palladium'    },
+  USOIL:  { stooq: 'cl.f',   etf: 'USO',  name: 'Crude Oil WTI'},
+  UKOIL:  { stooq: 'cb.f',   etf: 'BNO',  name: 'Brent Crude'  },
+  NATGAS: { stooq: 'ng.f',   etf: 'UNG',  name: 'Natural Gas'  },
+  COPPER: { stooq: 'hg.f',   etf: 'CPER', name: 'Copper'       },
+};
+
 function fetchWithTimeout(url, opts = {}, ms = 5000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
@@ -153,6 +178,44 @@ async function getStooqQuote(symbol) {
       volume24h: parseFloat(last[5]) || 0,
       source: 'Stooq/GPW'
     };
+  });
+}
+
+// Wykres dzienny ze Stooqa — obsluguje i GPW, i surowce.
+// Zwraca null zamiast rzucac, zeby wywolujacy mogl siegnac po zrodlo awaryjne.
+async function getStooqChart(stooqSym, limit = 90) {
+  return cached(`stooqchart:${stooqSym}:${limit}`, 300000, async () => {
+    try {
+      const now = new Date();
+      const d2 = now.toISOString().slice(0, 10).replace(/-/g, '');
+      // Z zapasem, bo weekendy i swieta nie maja notowan.
+      const d1 = new Date(now - (limit + 40) * 864e5).toISOString().slice(0, 10).replace(/-/g, '');
+      const r = await fetchWithTimeout(
+        `https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } },
+        6000
+      );
+      if (!r.ok) return null;
+      const csv = await r.text();
+      // Przy nieznanym symbolu Stooq oddaje strone HTML albo "No data".
+      if (!csv || csv.startsWith('<') || !csv.includes('Date')) return null;
+
+      const rows = csv.trim().split('\n').slice(1).filter(x => x.includes(','));
+      const klines = rows.map(line => {
+        const [date, o, h, l, c, v] = line.split(',');
+        return {
+          t: new Date(date).getTime(),
+          o: parseFloat(o), h: parseFloat(h),
+          l: parseFloat(l), c: parseFloat(c),
+          v: parseFloat(v) || 0,
+        };
+      }).filter(k => isFinite(k.c) && isFinite(k.t));
+
+      return klines.length ? klines.slice(-limit) : null;
+    } catch (e) {
+      console.log(`Stooq chart ${stooqSym}: ${e.message}`);
+      return null;
+    }
   });
 }
 
@@ -509,7 +572,11 @@ async function getFearGreed() {
 }
 
 async function getStockData(symbol) {
-  return cached(`stock:${symbol}`, 300000, async () => {
+  // Wlasny prefiks klucza — wczesniej dzielil `stock:${symbol}` z
+  // getStockPrice, ktore ma inny TTL i inny ksztalt wyniku. Nadpisywaly sie
+  // nawzajem, wiec raz przychodzila cena z Alpha Vantage, a raz ze Stooqa,
+  // zaleznie od tego, ktora funkcja trafila pierwsza.
+  return cached(`stockdata:${symbol}`, 300000, async () => {
     // Polskie walory: Stooq jako źródło główne
     if (symbol.endsWith('.WA') || symbol.startsWith('WIG')) {
       const sq = await getStooqQuote(symbol).catch(() => null);
@@ -709,9 +776,12 @@ async function buildContext(message) {
     ).catch(() => {})
   );
 
+  // 2,5 s zamiast 8 s. Rdzen rynku jest podgrzewany w tle (patrz warmMarketCore
+   // na koncu pliku), wiec w praktyce schodzi z cache natychmiast, a wolne
+  // zrodlo nie ma prawa kazac uzytkownikowi czekac osiem sekund na odpowiedz.
   await Promise.race([
     Promise.all(promises),
-    new Promise(res => setTimeout(res, 8000))  // max 8s na dane — potem odpowiadamy tym co jest
+    new Promise(res => setTimeout(res, 2500))
   ]);
   return parts.length > 1 ? parts.join('\n') : null;
 }
@@ -850,6 +920,39 @@ const NO_DATA_NOTE = {
   de: 'HINWEIS: Der Live-Daten-Abschnitt ist heute leer. Antworte fundiert und selbstsicher auf Basis von allgemeinem Wissen. Erwähne NICHT den fehlenden Zugriff auf Quellen (Binance usw.) und senke deswegen NICHT den AI Score. Verweise statt konkreter Preise auf die Tabs der App (CRYPTO, STOCKS, METALS). Verweise NICHT auf einen FOREX-Tab — dieser existiert in der mobilen App nicht.',
 };
 
+// TRYB PROSTY — dokladany do promptu, gdy uzytkownik wlaczy przelacznik.
+// Nie zastepuje systemowego promptu, tylko zmienia sposob mowienia; dzieki
+// temu AI dalej ma wszystkie dane i zasady, a jedynie inaczej je podaje.
+const SIMPLE_MODE = {
+  pl: `‼️ TRYB PROSTY — WŁĄCZONY. Tłumacz tak, jakbyś rozmawiał z kimś, kto pierwszy raz słyszy o giełdzie.
+ZASADY TRYBU PROSTEGO (ważniejsze niż szablony odpowiedzi powyżej):
+- Zero żargonu. Jeśli musisz użyć terminu (RSI, wolumen, kapitalizacja), wytłumacz go w tym samym zdaniu prostymi słowami.
+- Krótkie zdania. Maksymalnie 2-3 akapity.
+- Zamiast tabel i pól typu "Kurs docelowy" — zwykłe zdania.
+- Używaj porównań z życia codziennego (np. "to tak, jakby cena chleba wzrosła z 5 do 7 zł").
+- Zawsze powiedz wprost, co to oznacza dla zwykłego człowieka.
+- NIE używaj szablonu sygnału ani pól z emotkami. Pisz normalnym tekstem.
+- Zachowaj ostrzeżenie na końcu, ale sformułuj je prosto.`,
+  en: `‼️ SIMPLE MODE — ON. Explain as if talking to someone who has never heard of the stock market.
+SIMPLE MODE RULES (these override the answer templates above):
+- No jargon. If you must use a term (RSI, volume, market cap), explain it in the same sentence in plain words.
+- Short sentences. Two or three paragraphs at most.
+- No tables or fields like "Price target" — use ordinary sentences.
+- Use everyday comparisons (e.g. "it is like a loaf of bread going from 2 to 3 dollars").
+- Always state plainly what this means for an ordinary person.
+- Do NOT use the signal template or emoji fields. Write normal prose.
+- Keep the closing warning, but phrase it simply.`,
+  de: `‼️ EINFACHER MODUS — AN. Erkläre so, als sprächest du mit jemandem, der noch nie von der Börse gehört hat.
+REGELN DES EINFACHEN MODUS (sie haben Vorrang vor den Vorlagen oben):
+- Kein Fachjargon. Musst du einen Begriff verwenden (RSI, Volumen, Marktkapitalisierung), erkläre ihn im selben Satz mit einfachen Worten.
+- Kurze Sätze. Höchstens zwei bis drei Absätze.
+- Keine Tabellen oder Felder wie "Kursziel" — normale Sätze.
+- Nutze Vergleiche aus dem Alltag (z. B. "als würde ein Brot von 2 auf 3 Euro steigen").
+- Sage immer klar, was das für einen normalen Menschen bedeutet.
+- Verwende NICHT die Signal-Vorlage oder Emoji-Felder. Schreibe normalen Fließtext.
+- Behalte den Warnhinweis am Ende, formuliere ihn aber einfach.`,
+};
+
 function liveDataHeader(lang, now) {
   if (lang === 'en') return `‼️ LIVE DATA FROM BINANCE API (fetched ${now}) — USE THESE PRICES:`;
   if (lang === 'de') return `‼️ LIVE-DATEN VON DER BINANCE API (abgerufen ${now}) — VERWENDE DIESE PREISE:`;
@@ -863,8 +966,9 @@ const LIVE_DATA_FOOTER = {
 
 // ── POST /api/chat ────────────────────────────────────────────
 app.post('/api/chat', auth, checkPlan, async (req, res) => {
-  const { messages, lang: rawLang } = req.body;
+  const { messages, lang: rawLang, simple } = req.body;
   const lang = ['pl', 'en', 'de'].includes(rawLang) ? rawLang : 'pl';
+  const simpleMode = simple === true;
   if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'No messages' });
 
   const safe = messages
@@ -909,7 +1013,10 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
   }
 
   // Prosty system prompt bez danych rynkowych — dla Groq (trivial/probe)
-  const LOCALIZED_SYSTEM = SYSTEM_BY_LANG[lang] || SYSTEM;
+  // Tryb prosty dokladamy na koncu, zeby mial pierwszenstwo nad szablonami
+  // odpowiedzi z promptu systemowego.
+  const LOCALIZED_SYSTEM = (SYSTEM_BY_LANG[lang] || SYSTEM)
+    + (simpleMode ? '\n\n' + (SIMPLE_MODE[lang] || SIMPLE_MODE.en) : '');
   const BASE_SYSTEM = LOCALIZED_SYSTEM + '\n\n' + NO_DATA_NOTE[lang];
 
   try {
@@ -961,7 +1068,16 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
             body: JSON.stringify({
               model: 'claude-sonnet-4-6',
               max_tokens: 1024,
-              system: systemPrompt,
+              // Prompt systemowy rozbity na dwa bloki: staly (kilka tysiecy
+              // tokenow, identyczny przy kazdym zapytaniu) idzie z cache_control,
+              // wiec Anthropic przetwarza go raz zamiast za kazdym razem.
+              // Dane rynkowe zmieniaja sie co zapytanie, wiec zostaja poza cache.
+              system: [
+                { type: 'text', text: LOCALIZED_SYSTEM, cache_control: { type: 'ephemeral' } },
+                ...(context
+                  ? [{ type: 'text', text: liveDataHeader(lang, now) + '\n' + context + '\n' + LIVE_DATA_FOOTER[lang] }]
+                  : [{ type: 'text', text: NO_DATA_NOTE[lang] }]),
+              ],
               messages: safe.map(m => ({ role: m.role, content: m.content })),
             })
           });
@@ -1043,9 +1159,62 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
       });
 
     } else {
+      const up = sym.toUpperCase();
+
+      // ── Gieldy poza USA: Alpha Vantage nie zna .WA ani .DE, idziemy Stooqiem.
+      // Stooq trzyma polskie walory bez sufiksu (pkn), a niemieckie z nim (sap.de).
+      if (STOOQ_MAP[up] || up.endsWith('.WA') || up.endsWith('.DE')) {
+        const stooqSym = STOOQ_MAP[up]
+          || (up.endsWith('.WA') ? up.replace('.WA', '').toLowerCase() : up.toLowerCase());
+        const klines = await getStooqChart(stooqSym, limit);
+        if (!klines) return res.status(404).json({ error: `No exchange data for ${sym}` });
+
+        const last = klines[klines.length - 1];
+        const prev = klines[klines.length - 2];
+        return res.json({
+          symbol: up,
+          type: 'stock',
+          interval,
+          klines,
+          meta: {
+            price: last.c,
+            change24h: prev ? ((last.c - prev.c) / prev.c * 100) : 0,
+            volume24h: last.v,
+            source: up.endsWith('.DE') ? 'Stooq/XETRA' : 'Stooq/GPW',
+          }
+        });
+      }
+
+      // ── Surowce: najpierw Stooq, awaryjnie ETF przez Alpha Vantage ──
+      const commodity = COMMODITY_SOURCES[up];
+      if (commodity) {
+        const klines = await getStooqChart(commodity.stooq, limit);
+        if (klines) {
+          const last = klines[klines.length - 1];
+          const prev = klines[klines.length - 2];
+          console.log(`CHART ${up}: Stooq OK (${klines.length} swiec)`);
+          return res.json({
+            symbol: up,
+            type: 'commodity',
+            interval,
+            klines,
+            meta: {
+              price: last.c,
+              change24h: prev ? ((last.c - prev.c) / prev.c * 100) : 0,
+              volume24h: last.v,
+              source: 'Stooq',
+              name: commodity.name,
+            }
+          });
+        }
+        console.log(`CHART ${up}: Stooq odmowil, probuje ETF ${commodity.etf}`);
+      }
+
+      // Dla surowca bez danych ze Stooqa pytamy o ETF, ktory go sledzi.
+      const avSymbol = commodity ? commodity.etf : up;
       const size = limit <= 90 ? 'compact' : 'full';
       const r = await fetch(
-        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${sym.toUpperCase()}&outputsize=${size}&apikey=${AV_KEY}`
+        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${avSymbol}&outputsize=${size}&apikey=${AV_KEY}`
       );
       const d = await r.json();
       const ts = d['Time Series (Daily)'];
@@ -1069,11 +1238,20 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
       const change = prev ? ((last.c - prev.c) / prev.c * 100) : 0;
 
       return res.json({
-        symbol: sym.toUpperCase(),
-        type: 'stock',
+        symbol: up,
+        type: commodity ? 'commodity' : 'stock',
         interval,
         klines,
-        meta: { price: last.c, change24h: change, volume24h: last.v }
+        meta: {
+          price: last.c,
+          change24h: change,
+          volume24h: last.v,
+          // Przy surowcu z ETF-u mowimy wprost, ze to notowanie funduszu,
+          // a nie samego surowca — inaczej uzytkownik zobaczylby cene GLD
+          // i pomyslal, ze zloto kosztuje 300 dolarow.
+          source: commodity ? `ETF ${commodity.etf} (proxy)` : 'AlphaVantage',
+          ...(commodity ? { name: commodity.name, isProxy: true } : {}),
+        }
       });
     }
 
@@ -1484,14 +1662,48 @@ setInterval(checkAlerts, 5 * 60 * 1000);
 // NEWS FEED
 // ══════════════════════════════════════════════════════════════
 
-async function fetchCryptoNews() {
-  return cached('news:crypto', 300000, async () => {
-    const queries = ['cryptocurrency bitcoin', 'crypto ethereum', 'bitcoin price'];
+// Google News per jezyk. Zapytania musza byc w jezyku docelowym — samo
+// przestawienie hl/gl przy angielskiej frazie oddaje dalej anglojezyczne
+// wyniki, bo wyszukiwarka dopasowuje sie do tresci zapytania, nie do naglowka.
+const NEWS_LOCALES = {
+  pl: {
+    hl: 'pl', gl: 'PL', ceid: 'PL:pl',
+    queries: ['kryptowaluty bitcoin', 'giełda kurs akcji', 'bitcoin cena'],
+    fallback: [
+      { title: 'Bitcoin — analiza kursu i sytuacja na rynku', url: 'https://www.bankier.pl/kryptowaluty', source: 'Bankier.pl' },
+      { title: 'GPW — podsumowanie sesji na warszawskiej giełdzie', url: 'https://www.parkiet.com', source: 'Parkiet' },
+      { title: 'Rynki finansowe — przegląd tygodnia', url: 'https://www.money.pl/gielda', source: 'Money.pl' },
+    ],
+  },
+  de: {
+    hl: 'de', gl: 'DE', ceid: 'DE:de',
+    queries: ['Kryptowährung Bitcoin', 'Börse Aktienkurs', 'Bitcoin Kurs'],
+    fallback: [
+      { title: 'Bitcoin — Kursanalyse und Marktlage', url: 'https://www.handelsblatt.com/finanzen', source: 'Handelsblatt' },
+      { title: 'DAX — Zusammenfassung des Handelstages', url: 'https://www.boerse.de', source: 'boerse.de' },
+      { title: 'Finanzmärkte — Wöchentlicher Überblick', url: 'https://www.finanzen.net', source: 'finanzen.net' },
+    ],
+  },
+  en: {
+    hl: 'en-US', gl: 'US', ceid: 'US:en',
+    queries: ['cryptocurrency bitcoin', 'stock market shares', 'bitcoin price'],
+    fallback: [
+      { title: 'Bitcoin price analysis — latest market update', url: 'https://coindesk.com', source: 'CoinDesk' },
+      { title: 'Ethereum network activity reaches new highs', url: 'https://cointelegraph.com', source: 'CoinTelegraph' },
+      { title: 'Crypto market outlook — weekly summary', url: 'https://decrypt.co', source: 'Decrypt' },
+    ],
+  },
+};
+
+async function fetchCryptoNews(lang = 'en') {
+  const loc = NEWS_LOCALES[lang] || NEWS_LOCALES.en;
+  return cached(`news:${lang}`, 300000, async () => {
+    const queries = loc.queries;
 
     for (const query of queries) {
       try {
         const encoded = encodeURIComponent(query);
-        const url = `https://news.google.com/rss/search?q=${encoded}&hl=en-US&gl=US&ceid=US:en`;
+        const url = `https://news.google.com/rss/search?q=${encoded}&hl=${loc.hl}&gl=${loc.gl}&ceid=${loc.ceid}`;
         const r = await fetch(url, {
           headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FinAI/2.0)' }
         });
@@ -1524,18 +1736,23 @@ async function fetchCryptoNews() {
       } catch(e) { console.log('Google News error:', e.message); }
     }
 
-    return [
-      { title: 'Bitcoin price analysis — latest market update', url: 'https://coindesk.com', source: 'CoinDesk', category: 'crypto', published: new Date().toISOString(), summary: '' },
-      { title: 'Ethereum network activity reaches new highs', url: 'https://cointelegraph.com', source: 'CoinTelegraph', category: 'crypto', published: new Date().toISOString(), summary: '' },
-      { title: 'Crypto market outlook — weekly summary', url: 'https://decrypt.co', source: 'Decrypt', category: 'crypto', published: new Date().toISOString(), summary: '' },
-    ];
+    // Gdy Google nie odda nic sensownego, pokazujemy zaslepki w jezyku
+    // uzytkownika zamiast anglojezycznych — inaczej Polak przy pustym
+    // wyniku dostawal trzy angielskie tytuly i wygladalo to na blad.
+    return loc.fallback.map(x => ({
+      ...x,
+      category: 'crypto',
+      published: new Date().toISOString(),
+      summary: '',
+    }));
   });
 }
 
 app.get('/api/news', auth, async (req, res) => {
   try {
-    const news = await fetchCryptoNews();
-    res.json({ news, category: req.query.category || 'crypto' });
+    const lang = ['pl', 'en', 'de'].includes(req.query.lang) ? req.query.lang : 'en';
+    const news = await fetchCryptoNews(lang);
+    res.json({ news, lang, category: req.query.category || 'crypto' });
   } catch(e) {
     res.status(502).json({ error: 'News fetch error' });
   }
@@ -1634,5 +1851,21 @@ app.get('/health', (_, res) => res.json({ status: 'ok', v: 2, source: 'binance' 
 
 const SELF = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
 setInterval(() => fetch(SELF + '/health').catch(() => {}), 14 * 60 * 1000);
+
+// ── Podgrzewanie rdzenia rynku ────────────────────────────────
+//
+// BTC, ETH i Fear&Greed idą do promptu przy KAŻDYM zapytaniu do Claude.
+// Przy chybieniu cache uzytkownik czekal na pelne okrazenie do Binance,
+// zanim cokolwiek poszlo do modelu. Odswiezamy je w tle co 12 s (TTL tickera
+// to 15 s), wiec buildContext praktycznie zawsze czyta z pamieci.
+async function warmMarketCore() {
+  await Promise.allSettled([
+    getBinanceTicker('BTCUSDT'),
+    getBinanceTicker('ETHUSDT'),
+    getFearGreed(),
+  ]);
+}
+warmMarketCore().catch(() => {});
+setInterval(() => warmMarketCore().catch(() => {}), 12000);
 
 app.listen(PORT, () => console.log(`AURIMIQ.ai on port ${PORT}`));
