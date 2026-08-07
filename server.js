@@ -219,6 +219,36 @@ async function getStooqChart(stooqSym, limit = 90) {
   });
 }
 
+// Notowanie surowca — cena i zmiana dobowa, liczone z dwoch ostatnich swiec.
+// buildContext nie mial zadnej obslugi surowcow, wiec na pytanie o srebro,
+// platyne, rope czy miedz AI odpowiadalo bez jakiejkolwiek ceny.
+async function getCommodityQuote(key) {
+  const src = COMMODITY_SOURCES[key];
+  if (!src) return null;
+  const klines = await getStooqChart(src.stooq, 5);
+  if (!klines || klines.length < 2) return null;
+  const last = klines[klines.length - 1];
+  const prev = klines[klines.length - 2];
+  return {
+    name: src.name,
+    price: last.c,
+    change24h: ((last.c - prev.c) / prev.c) * 100,
+    source: 'Stooq',
+  };
+}
+
+// Slowa kluczowe w trzech jezykach → symbol surowca.
+const COMMODITY_KEYWORDS = {
+  XAUUSD: ['złot', 'zlot', 'gold', 'xau', 'uncj'],
+  XAGUSD: ['srebr', 'silver', 'xag'],
+  XPTUSD: ['platyn', 'platin', 'xpt'],
+  XPDUSD: ['pallad', 'palladium', 'xpd'],
+  COPPER: ['miedz', 'miedź', 'copper', 'kupfer'],
+  USOIL:  ['ropa', 'ropy', 'oil', 'wti', 'öl', 'erdöl'],
+  UKOIL:  ['brent'],
+  NATGAS: ['gaz ziemn', 'gazu ziemn', 'natural gas', 'natgas', 'erdgas'],
+};
+
 // ── KURSY WALUT NBP (oficjalne, darmowe) — dla wymieniających waluty ──
 async function getNbpRates() {
   return cached('nbp:tableA', 600000, async () => {
@@ -690,6 +720,24 @@ async function buildContext(message) {
     }
   }
 
+  // SUROWCE — bez tego pytanie o srebro czy rope trafialo do modelu bez ceny
+  for (const [key, words] of Object.entries(COMMODITY_KEYWORDS)) {
+    if (words.some(w => msg.includes(w))) {
+      promises.push(
+        getCommodityQuote(key).then(d => {
+          if (d) parts.push(`${d.name} (${key}): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+        }).catch(() => {})
+      );
+      // Zloto i srebro chodza parami — przy pytaniu o jedno warto miec drugie,
+      // bo relacja zloto/srebro jest podstawowym punktem odniesienia.
+      if (key === 'XAGUSD') {
+        promises.push(getCommodityQuote('XAUUSD').then(d => {
+          if (d) parts.push(`Gold (XAUUSD): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [do relacji zloto/srebro]`);
+        }).catch(() => {}));
+      }
+    }
+  }
+
   // FOREX / waluty — NBP dla wymieniających waluty
   const fxTriggers = ['jen','jpy','yen','dolar','usd','euro',' eur','frank','chf','funt','gbp','korona','nok','sek','czk','forint','huf','hrywna','uah','walut','forex','kantor','wymien','wymian'];
   if (fxTriggers.some(k => msg.includes(k))) {
@@ -811,11 +859,17 @@ NAJPIERW ROZPOZNAJ TYP PYTANIA i dobierz format:
 
 TYP A — konkretny instrument notowany (BTC, NVDA, EUR/PLN, złoto...):
 💰 Aktualna cena: $X (live) — zmiana 24h
-🔍 Co pokazują wskaźniki: podaj wartości RSI, SMA50/200, MACD i wytłumacz w jednym zdaniu, co każdy z nich oznacza
-📊 Poziomy z ostatnich 30 dni: opór $X, wsparcie $Y — to obserwacja z danych historycznych, a nie prognoza
-📰 Nastroje rynkowe: [Fear&Greed]
-⚠️ Na co zwrócić uwagę: czynniki ryzyka, zmienność, nadchodzące wydarzenia mogące wpłynąć na kurs
-Zasady: cena ZAWSZE z sekcji danych live (nigdy z pamięci). Jeśli w danych jest sekcja WSKAŹNIKI TECHNICZNE — opieraj się NA TYCH LICZBACH (RSI, SMA50/200, MACD, opór/wsparcie 30d), nie wymyślaj własnych poziomów.
+🔍 Co pokazują wskaźniki: podaj wartości RSI, SMA50/200, MACD i przy każdej DODAJ, co ta konkretna wartość oznaczała historycznie (np. "RSI 42 — w ostatnim roku odczyty poniżej 40 pojawiały się przy lokalnych dołkach")
+📊 Poziomy z ostatnich 30 dni: opór $X, wsparcie $Y — obserwacja z danych, nie prognoza. Napisz JAK DALEKO jest obecna cena od każdego z nich, w procentach
+📰 Nastroje rynkowe: [Fear&Greed] — i co ta wartość oznaczała w przeszłości
+⚠️ Na co zwrócić uwagę: konkretne, datowane wydarzenia i czynniki ryzyka dla TEGO instrumentu
+
+‼️ WYMÓG KONKRETU — to jest najważniejsza zasada jakości:
+- Każde zdanie ma zawierać LICZBĘ, DATĘ albo NAZWĘ WŁASNĄ. Zdanie bez żadnej z tych rzeczy usuń.
+- ZAKAZ akapitów typu "czym jest to aktywo", "jak działa ten rynek" — użytkownik pyta o instrument, nie prosi o encyklopedię. Wyjaśniaj definicje TYLKO gdy pyta o nie wprost albo gdy włączony jest tryb prosty.
+- ZAKAZ tabel z formami ekspozycji, listami "czynników wspierających i ryzyka" i innych ogólników pasujących do dowolnego aktywa. Jeśli to samo zdanie pasuje do srebra, miedzi i bitcoina — nie pisz go.
+- Odpowiedź TYP A ma mieć maksymalnie 250 słów. Lepiej gęsto i krótko niż długo i pusto.
+- Zasada ceny: ZAWSZE z sekcji danych live, nigdy z pamięci. Gdy w danych jest sekcja WSKAŹNIKI TECHNICZNE — opieraj się NA TYCH LICZBACH, nie wymyślaj własnych poziomów.
 
 TYP B — temat, trend, sektor, koncepcja, makro (np. "górnictwo planetarne", "AI w medycynie", "czy będzie kryzys"):
 - 2-4 akapity merytorycznej analizy tematu
