@@ -1376,6 +1376,75 @@ app.get('/api/profile', auth, async (req, res) => {
   res.json({ plan, queries_today: queries, total_queries_ever: totalEver, limit: plan === 'pro' ? 999 : planLimit(plan), remaining });
 });
 
+// ── DELETE /api/account — trwałe usunięcie konta i wszystkich danych ──
+app.delete('/api/account', auth, async (req, res) => {
+  const uid = req.user.id;
+
+  // 1. Anuluj aktywną subskrypcję (Stripe — terminal webowy, Google Play — apka),
+  //    żeby nie obciążać usuniętego konta.
+  try {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id, play_purchase_token')
+      .eq('id', uid)
+      .single();
+
+    if (profile?.stripe_customer_id) {
+      const subs = await stripe.subscriptions.list({ customer: profile.stripe_customer_id, status: 'active', limit: 10 });
+      for (const sub of subs.data) {
+        await stripe.subscriptions.cancel(sub.id).catch(e => console.log('Stripe cancel error:', e.message));
+      }
+    }
+
+    if (profile?.play_purchase_token) {
+      try {
+        const client = getPlayClient();
+        if (client) {
+          const sub = await fetchPlaySubscription(profile.play_purchase_token);
+          const items = sub.lineItems || [];
+          const productId = items[items.length - 1]?.productId;
+          if (productId) {
+            await client.purchases.subscriptions.cancel({
+              packageName: PLAY_PACKAGE,
+              subscriptionId: productId,
+              token: profile.play_purchase_token,
+            });
+          }
+        }
+      } catch (e) {
+        console.log('Play cancel error (kontynuuję usuwanie):', e.message);
+      }
+    }
+  } catch (e) {
+    console.log('Billing cleanup error (kontynuuję usuwanie):', e.message);
+  }
+
+  // 2. Usuń dane użytkownika ze wszystkich tabel
+  try {
+    await supabase.from('chat_history').delete().eq('user_id', uid);
+    await supabase.from('portfolio').delete().eq('user_id', uid);
+    await supabase.from('price_alerts').delete().eq('user_id', uid);
+    await supabase.from('profiles').delete().eq('id', uid);
+  } catch (e) {
+    console.error('DELETE ACCOUNT — błąd czyszczenia danych:', e.message);
+    return res.status(500).json({ error: 'Nie udało się usunąć danych konta: ' + e.message });
+  }
+
+  // 3. Usuń użytkownika z Supabase Auth (wymaga service role key)
+  try {
+    const { error: authErr } = await supabase.auth.admin.deleteUser(uid);
+    if (authErr) {
+      console.error('DELETE ACCOUNT — błąd usuwania z Auth:', authErr.message);
+      return res.status(500).json({ error: 'Dane konta usunięte, ale nie udało się usunąć logowania: ' + authErr.message });
+    }
+  } catch (e) {
+    console.error('DELETE ACCOUNT — wyjątek przy usuwaniu z Auth:', e.message);
+    return res.status(500).json({ error: 'Dane konta usunięte, ale nie udało się usunąć logowania: ' + e.message });
+  }
+
+  res.json({ deleted: true });
+});
+
 // ── GET /api/history ──────────────────────────────────────────
 app.get('/api/history', auth, async (req, res) => {
   const { data, error } = await supabase
