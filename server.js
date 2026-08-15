@@ -1171,7 +1171,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
 
       if (!reply) {
         reply = await askGroq(systemPrompt, safe);
-        if (reply) { usedModel = 'groq-fallback'; console.log('Model: Groq Llama 3.3 (fallback)'); }
+        if (reply) { usedModel = 'groq-fallback'; console.log('Model: Groq GPT-OSS 120B (fallback)'); }
       }
     }
 
