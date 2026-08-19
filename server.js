@@ -106,14 +106,27 @@ const cache = new Map();
 // sam klucz dziela jedno okraženie sieciowe zamiast strzelac dwa razy —
 // wczesniej przy pytaniu o kryzys BTC leciał do Binance dwukrotnie, bo zaden
 // z wywolan nie zdazyl jeszcze zapisac wyniku.
+//
+// TTL negatywny: pusty wynik (null) trzymamy 30 s, nie pelne TTL. Wczesniej
+// jedna chwilowa odmowa Stooqa oslepiala surowce na piec minut — a wlasnie
+// tak wygladal blad "nie mam ceny srebra" przy dzialajacej zakladce SUROWCE.
+const NEG_TTL = 30000;
 function cached(key, ttl, fn) {
   const now = Date.now();
   const hit = cache.get(key);
-  if (hit && now - hit.ts < ttl) return hit.p;
+  if (hit && now - hit.ts < (hit.neg ? NEG_TTL : ttl)) return hit.p;
   // Bledu nie zapamietujemy — inaczej jedna chwilowa awaria zrodla
   // blokowalaby dane na caly TTL.
-  const p = fn().catch(err => { cache.delete(key); throw err; });
-  cache.set(key, { p, ts: now });
+  const p = fn()
+    .then(v => {
+      if (v == null) {
+        const e = cache.get(key);
+        if (e && e.p === p) e.neg = true;
+      }
+      return v;
+    })
+    .catch(err => { cache.delete(key); throw err; });
+  cache.set(key, { p, ts: now, neg: false });
   return p;
 }
 
@@ -138,15 +151,19 @@ const STOOQ_MAP = {
 // probujemy najpierw Stooqa (prawdziwe ceny surowca), a gdy odmowi — ETF-u,
 // ktory sledzi ten sam instrument. ETF pokazuje inna wartosc bezwzgledna niz
 // surowiec, dlatego jest wylacznie awaryjny i oznaczamy go w odpowiedzi.
+// Yahoo trzyma kontrakty terminowe pod symbolami z sufiksem "=F" i nie wymaga
+// klucza — to jedyne darmowe zrodlo prawdziwej ceny surowca poza Stooqiem.
+// Kolejnosc: Stooq → Yahoo futures → ETF. ETF jest ostatni, bo pokazuje inna
+// wartosc bezwzgledna niz surowiec i musi byc oznaczony jako proxy.
 const COMMODITY_SOURCES = {
-  XAUUSD: { stooq: 'xauusd', etf: 'GLD',  name: 'Gold'         },
-  XAGUSD: { stooq: 'xagusd', etf: 'SLV',  name: 'Silver'       },
-  XPTUSD: { stooq: 'xptusd', etf: 'PPLT', name: 'Platinum'     },
-  XPDUSD: { stooq: 'xpdusd', etf: 'PALL', name: 'Palladium'    },
-  USOIL:  { stooq: 'cl.f',   etf: 'USO',  name: 'Crude Oil WTI'},
-  UKOIL:  { stooq: 'cb.f',   etf: 'BNO',  name: 'Brent Crude'  },
-  NATGAS: { stooq: 'ng.f',   etf: 'UNG',  name: 'Natural Gas'  },
-  COPPER: { stooq: 'hg.f',   etf: 'CPER', name: 'Copper'       },
+  XAUUSD: { stooq: 'xauusd', yahoo: 'GC=F', etf: 'GLD',  name: 'Gold'         },
+  XAGUSD: { stooq: 'xagusd', yahoo: 'SI=F', etf: 'SLV',  name: 'Silver'       },
+  XPTUSD: { stooq: 'xptusd', yahoo: 'PL=F', etf: 'PPLT', name: 'Platinum'     },
+  XPDUSD: { stooq: 'xpdusd', yahoo: 'PA=F', etf: 'PALL', name: 'Palladium'    },
+  USOIL:  { stooq: 'cl.f',   yahoo: 'CL=F', etf: 'USO',  name: 'Crude Oil WTI'},
+  UKOIL:  { stooq: 'cb.f',   yahoo: 'BZ=F', etf: 'BNO',  name: 'Brent Crude'  },
+  NATGAS: { stooq: 'ng.f',   yahoo: 'NG=F', etf: 'UNG',  name: 'Natural Gas'  },
+  COPPER: { stooq: 'hg.f',   yahoo: 'HG=F', etf: 'CPER', name: 'Copper'       },
 };
 
 function fetchWithTimeout(url, opts = {}, ms = 5000) {
@@ -222,19 +239,149 @@ async function getStooqChart(stooqSym, limit = 90) {
 // Notowanie surowca — cena i zmiana dobowa, liczone z dwoch ostatnich swiec.
 // buildContext nie mial zadnej obslugi surowcow, wiec na pytanie o srebro,
 // platyne, rope czy miedz AI odpowiadalo bez jakiejkolwiek ceny.
+//
+// Zrodlo glowne: Stooq. Awaryjne: kontrakt terminowy z Yahoo, a dopiero na
+// koncu ETF sledzacy surowiec.
+//
+// Ta kaskada istniala WYLACZNIE w /api/chart (zakladka SUROWCE), a
+// getCommodityQuote — czyli sciezka, z ktorej korzysta AI — mialo sam Stooq.
+// Stad rozjazd: zakladka pokazywala cene srebra, a czat odpowiadal, ze nie ma
+// danych dla tego instrumentu.
+async function getYahooQuote(symbol) {
+  return cached(`yahoo:${symbol}`, 120000, async () => {
+    try {
+      const r = await fetchWithTimeout(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } },
+        4000
+      );
+      if (!r.ok) return null;
+      const d = await r.json();
+      const meta = d?.chart?.result?.[0]?.meta;
+      const price = meta?.regularMarketPrice;
+      if (!isFinite(price)) return null;
+      const prev = meta.chartPreviousClose || meta.previousClose || price;
+      return {
+        price,
+        change24h: prev ? ((price - prev) / prev) * 100 : 0,
+        source: 'Yahoo',
+      };
+    } catch (e) {
+      console.log(`Yahoo ${symbol}: ${e.message}`);
+      return null;
+    }
+  });
+}
+
+// Swiece dzienne z Yahoo — to samo zrodlo co getYahooQuote, tylko caly szereg.
+// Uzywane jako drugi stopien dla wykresow surowcow, zeby zakladka SUROWCE nie
+// spadala od razu na ETF (ktory ma inna wartosc bezwzgledna niz surowiec).
+async function getYahooChart(symbol, limit = 90) {
+  return cached(`yahoochart:${symbol}:${limit}`, 300000, async () => {
+    try {
+      const range = limit <= 90 ? '6mo' : '2y';
+      const r = await fetchWithTimeout(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } },
+        6000
+      );
+      if (!r.ok) return null;
+      const d = await r.json();
+      const res = d?.chart?.result?.[0];
+      const ts = res?.timestamp;
+      const q = res?.indicators?.quote?.[0];
+      if (!Array.isArray(ts) || !q) return null;
+      const klines = ts.map((t, i) => ({
+        t: t * 1000,
+        o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i],
+        v: q.volume?.[i] || 0,
+      })).filter(k => isFinite(k.c) && isFinite(k.t));
+      return klines.length ? klines.slice(-limit) : null;
+    } catch (e) {
+      console.log(`Yahoo chart ${symbol}: ${e.message}`);
+      return null;
+    }
+  });
+}
+
 async function getCommodityQuote(key) {
   const src = COMMODITY_SOURCES[key];
   if (!src) return null;
-  const klines = await getStooqChart(src.stooq, 5);
-  if (!klines || klines.length < 2) return null;
-  const last = klines[klines.length - 1];
-  const prev = klines[klines.length - 2];
-  return {
-    name: src.name,
-    price: last.c,
-    change24h: ((last.c - prev.c) / prev.c) * 100,
-    source: 'Stooq',
-  };
+
+  // 1. Stooq — prawdziwa cena spot/kontraktu
+  const klines = await getStooqChart(src.stooq, 5).catch(() => null);
+  if (klines && klines.length >= 2) {
+    const last = klines[klines.length - 1];
+    const prev = klines[klines.length - 2];
+    return {
+      name: src.name,
+      price: last.c,
+      change24h: ((last.c - prev.c) / prev.c) * 100,
+      source: 'Stooq',
+      isProxy: false,
+    };
+  }
+
+  // 2. Yahoo — kontrakt terminowy, nadal prawdziwa cena surowca
+  if (src.yahoo) {
+    const y = await getYahooQuote(src.yahoo).catch(() => null);
+    if (y) {
+      return {
+        name: src.name,
+        price: y.price,
+        change24h: y.change24h,
+        source: `Yahoo ${src.yahoo}`,
+        isProxy: false,
+      };
+    }
+  }
+
+  // 3. ETF — inna wartosc bezwzgledna niz surowiec, wiec musi byc oznaczony
+  if (src.etf) {
+    const e = await getStockPrice(src.etf).catch(() => null);
+    if (e) {
+      return {
+        name: src.name,
+        price: e.price,
+        change24h: e.change24h,
+        source: `ETF ${src.etf} (proxy)`,
+        isProxy: true,
+      };
+    }
+  }
+
+  return null;
+}
+
+// Wskazniki techniczne dla surowca — liczone z tych samych funkcji co krypto,
+// tylko na swiecach ze Stooqa. Bez tego prompt TYPU A kazal modelowi podac
+// RSI/SMA/MACD dla srebra czy zlota, a dane techniczne dostawalo wylacznie
+// krypto (getTechnicals chodzi po getBinanceChart). Model albo zmyslal liczby,
+// albo rozmywal odpowiedz ogolnikami.
+async function getCommodityTechnicals(key) {
+  const src = COMMODITY_SOURCES[key];
+  if (!src) return null;
+  return cached(`techcom:${key}`, 600000, async () => {
+    const klines = await getStooqChart(src.stooq, 220).catch(() => null);
+    if (!klines || klines.length < 60) return null;
+    const closes = klines.map(k => k.c);
+    const highs = klines.map(k => k.h).filter(isFinite);
+    const lows = klines.map(k => k.l).filter(isFinite);
+    const last = closes[closes.length - 1];
+    const rsi = calcRSI(closes);
+    const sma50 = calcSMA(closes, 50);
+    const sma200 = calcSMA(closes, 200);
+    const macd = calcMACD(closes);
+    const w = [];
+    if (rsi != null) w.push(`RSI(14): ${rsi.toFixed(1)} ${rsi > 70 ? '(wykupienie)' : rsi < 30 ? '(wyprzedanie)' : '(neutralnie)'}`);
+    if (sma50 != null) w.push(`SMA50: $${sma50.toFixed(2)} (cena ${last > sma50 ? 'POWYŻEJ' : 'PONIŻEJ'})`);
+    if (sma200 != null) w.push(`SMA200: $${sma200.toFixed(2)} (cena ${last > sma200 ? 'POWYŻEJ' : 'PONIŻEJ'})${sma50 != null ? (sma50 > sma200 ? ' | złoty krzyż' : ' | krzyż śmierci') : ''}`);
+    if (macd != null) w.push(`MACD: ${macd >= 0 ? '+' : ''}${macd.toFixed(2)} (${macd >= 0 ? 'byczo' : 'niedźwiedzio'})`);
+    if (highs.length >= 30 && lows.length >= 30) {
+      w.push(`Opór 30d: $${Math.max(...highs.slice(-30)).toFixed(2)} | Wsparcie 30d: $${Math.min(...lows.slice(-30)).toFixed(2)}`);
+    }
+    return w.length ? w.join('\n') : null;
+  });
 }
 
 // Slowa kluczowe w trzech jezykach → symbol surowca.
@@ -650,6 +797,12 @@ async function buildContext(message) {
   const msg = message.toLowerCase();
   const parts = [`CZAS: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
+  // Diagnostyka: co pytanie zamowilo (`wanted`) i co faktycznie doszlo (`hits`).
+  // Bez tego nie da sie odpowiedziec na pytanie "ile procent pytan o srebro
+  // dostalo cene" — a wlasnie tego brakowalo, zeby zauwazyc awarie Stooqa.
+  const wanted = new Set();
+  const hits = new Set();
+  const t0 = Date.now();
 
   const cryptoKeywords = {
     'bitcoin|btc|btcusdt': 'BTCUSDT',
@@ -704,9 +857,10 @@ async function buildContext(message) {
   for (const [keys, binSym] of Object.entries(cryptoKeywords)) {
     const mentioned = keys.split('|').some(k => msg.includes(k));
     if (mentioned && binSym !== 'BTCUSDT') {
+      wanted.add(binSym);
       promises.push(
         getBinanceTicker(binSym).then(d => {
-          if (d) parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source || 'BINANCE'} LIVE]`);
+          if (d) { parts.push(`${binSym}: $${d.price.toLocaleString('en-US', {maximumFractionDigits: 4})} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source || 'BINANCE'} LIVE]`); hits.add(binSym); }
         }).catch(() => {})
       );
     }
@@ -721,18 +875,34 @@ async function buildContext(message) {
   }
 
   // SUROWCE — bez tego pytanie o srebro czy rope trafialo do modelu bez ceny
+  const fmtCommodity = (key, d, suffix = '') => {
+    const tag = d.isProxy
+      ? `${d.source} — notowanie funduszu, NIE cena spot surowca`
+      : d.source;
+    return `${d.name} (${key}): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${tag}]${suffix}`;
+  };
+
   for (const [key, words] of Object.entries(COMMODITY_KEYWORDS)) {
     if (words.some(w => msg.includes(w))) {
+      wanted.add(key);
       promises.push(
         getCommodityQuote(key).then(d => {
-          if (d) parts.push(`${d.name} (${key}): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [${d.source}]`);
+          if (d) { parts.push(fmtCommodity(key, d)); hits.add(key); }
+        }).catch(() => {})
+      );
+      // Wskazniki liczone z tych samych swiec co dla krypto — inaczej prompt
+      // TYPU A prosil o RSI/SMA/MACD, ktorych model dla surowca nie dostawal.
+      promises.push(
+        getCommodityTechnicals(key).then(t => {
+          if (t) parts.push(`WSKAŹNIKI TECHNICZNE ${key} (policzone z danych 1D):\n${t}`);
         }).catch(() => {})
       );
       // Zloto i srebro chodza parami — przy pytaniu o jedno warto miec drugie,
       // bo relacja zloto/srebro jest podstawowym punktem odniesienia.
       if (key === 'XAGUSD') {
+        wanted.add('XAUUSD');
         promises.push(getCommodityQuote('XAUUSD').then(d => {
-          if (d) parts.push(`Gold (XAUUSD): $${d.price.toFixed(2)} | 24h: ${d.change24h >= 0 ? '+' : ''}${d.change24h.toFixed(2)}% [do relacji zloto/srebro]`);
+          if (d) { parts.push(fmtCommodity('XAUUSD', d, ' (do relacji złoto/srebro)')); hits.add('XAUUSD'); }
         }).catch(() => {}));
       }
     }
@@ -824,26 +994,47 @@ async function buildContext(message) {
     ).catch(() => {})
   );
 
-  // 2,5 s zamiast 8 s. Rdzen rynku jest podgrzewany w tle (patrz warmMarketCore
-   // na koncu pliku), wiec w praktyce schodzi z cache natychmiast, a wolne
-  // zrodlo nie ma prawa kazac uzytkownikowi czekac osiem sekund na odpowiedz.
+  // Budzet czasowy, nie sztywne oczekiwanie — wyscig konczy sie w momencie,
+  // gdy ostatnie zrodlo odda dane. Bylo 2500 ms przy timeoucie Stooqa 6000 ms,
+  // wiec surowiec z zimnym cache NIE MIAL SZANS zdazyc i wypadal z kontekstu.
+  // 4500 ms mieszcza sie oba realne zrodla surowcow (Stooq 4 s, Yahoo 4 s),
+  // a rdzen rynku i tak schodzi z podgrzanego cache w kilka milisekund.
   await Promise.race([
     Promise.all(promises),
-    new Promise(res => setTimeout(res, 2500))
+    new Promise(res => setTimeout(res, 4500))
   ]);
+
+  // Kontrakt danych: model dostaje jawna liste tego, czego NIE ma. Wczesniej
+  // musial zgadywac z samego braku wiersza i konczyl na "instrument nie jest
+  // w obecnym zestawie danych", nawet gdy zakladka SUROWCE pokazywala cene.
+  const missing = [...wanted].filter(k => !hits.has(k));
+  if (missing.length) {
+    parts.push(`BRAK DANYCH LIVE DLA: ${missing.join(', ')} — powiedz o tym wprost i nie podawaj ceny z pamięci.`);
+  }
+
+  console.log(
+    `ctx ${Date.now() - t0}ms | zamówione: ${[...wanted].join(',') || '-'} | ` +
+    `dostarczone: ${[...hits].join(',') || '-'} | braki: ${missing.join(',') || '-'} | wierszy: ${parts.length - 1}`
+  );
+
   return parts.length > 1 ? parts.join('\n') : null;
 }
 
 // ── System prompt ─────────────────────────────────────────────
 const SYSTEM = `Jesteś AURIMIQ.ai AI — eksperckim asystentem analiz finansowych.
 
-‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE Z BINANCE API" znajdziesz AKTUALNE ceny pobrane właśnie teraz z Binance/AlphaVantage/ExchangeRate API. MUSISZ używać TYCH cen. Twoje dane treningowe są nieaktualne. Nigdy nie używaj cen z pamięci.
+‼️ NAJWAŻNIEJSZA ZASADA: W sekcji "DANE RYNKOWE LIVE" znajdziesz AKTUALNE ceny pobrane właśnie teraz. MUSISZ używać TYCH cen. Twoje dane treningowe są nieaktualne. Nigdy nie używaj cen z pamięci.
 
 ŹRÓDŁA DANYCH:
-- Krypto (BTC, ETH, SOL...): Binance API → CoinGecko → Kraken
-- Akcje (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance
-- Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
-- Metale (GOLD, SILVER): CoinGecko/OANDA
+- Krypto (BTC, ETH, SOL...): Binance → Binance.US → CoinGecko → Kraken
+- Akcje (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance → Stooq
+- Forex (EUR/PLN, USD/PLN...): NBP (tabela A) → ExchangeRate API
+- Surowce i metale (złoto, srebro, ropa, miedź): Stooq → kontrakty Yahoo → ETF
+
+‼️ JAK CZYTAĆ SEKCJĘ DANYCH:
+- Wiersz oznaczony "ETF ... (proxy)" to notowanie FUNDUSZU, nie cena surowca. Podaj go jako cenę ETF-u i powiedz wprost, że to nie jest cena spot.
+- Wiersz "BRAK DANYCH LIVE DLA: X" znaczy, że dla X naprawdę nie ma notowania. Powiedz to i NIE podawaj ceny z pamięci.
+- Jeśli dla instrumentu NIE MA sekcji "WSKAŹNIKI TECHNICZNE" — pomiń punkt 🔍 całkowicie. Nie wymyślaj RSI, SMA ani poziomów.
 
 Jeśli brak danych na żywo dla instrumentu — powiedz to krótko i uczciwie ("nie mam teraz aktualnej ceny tego instrumentu"), opisz sytuację na bazie wiedzy ogólnej i zaznacz, że dane mogą być nieaktualne. Odeślij do zakładek aplikacji (CRYPTO, STOCKS, SUROWCE). Nie udawaj pewności, której nie masz — w finansach pewnie brzmiąca pomyłka jest gorsza niż przyznanie się do luki.
 
@@ -891,13 +1082,18 @@ Odpowiadaj po polsku.`;
 // ── System prompt — English ────────────────────────────────────
 const SYSTEM_EN = `You are AURIMIQ.ai AI — an expert financial analysis assistant.
 
-‼️ MOST IMPORTANT RULE: In the "LIVE DATA FROM BINANCE API" section you'll find CURRENT prices fetched right now from Binance/AlphaVantage/ExchangeRate APIs. You MUST use THESE prices. Your training data is outdated. Never use prices from memory.
+‼️ MOST IMPORTANT RULE: In the "LIVE MARKET DATA" section you'll find CURRENT prices fetched right now. You MUST use THESE prices. Your training data is outdated. Never use prices from memory.
 
 DATA SOURCES:
-- Crypto (BTC, ETH, SOL...): Binance API → CoinGecko → Kraken
-- Stocks (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance
-- Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
-- Metals (GOLD, SILVER): CoinGecko/OANDA
+- Crypto (BTC, ETH, SOL...): Binance → Binance.US → CoinGecko → Kraken
+- Stocks (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance → Stooq
+- Forex (EUR/PLN, USD/PLN...): NBP (table A) → ExchangeRate API
+- Commodities and metals (gold, silver, oil, copper): Stooq → Yahoo futures → ETF
+
+‼️ HOW TO READ THE DATA SECTION:
+- A row tagged "ETF ... (proxy)" is the FUND's quote, not the commodity price. Report it as the ETF price and say plainly it is not the spot price.
+- A row "BRAK DANYCH LIVE DLA: X" means there really is no quote for X. Say so and do NOT give a price from memory.
+- If an instrument has NO "WSKAŹNIKI TECHNICZNE" section — skip the 🔍 bullet entirely. Do not invent RSI, SMA or levels.
 
 If there's no live data for an instrument — say so briefly and honestly ("I don't have a current price for this instrument right now"), describe the situation from general knowledge and flag that it may be out of date. Point to the app's tabs (CRYPTO, STOCKS, COMMODITIES). Don't fake confidence you don't have — in finance, a confident mistake is worse than admitting a gap.
 
@@ -939,13 +1135,18 @@ Respond entirely in English. Never use any Polish words, even if the underlying 
 // ── System prompt — Deutsch ─────────────────────────────────────
 const SYSTEM_DE = `Du bist AURIMIQ.ai AI — ein fachkundiger Assistent für Finanzanalysen.
 
-‼️ WICHTIGSTE REGEL: Im Abschnitt "LIVE-DATEN VON DER BINANCE API" findest du AKTUELLE Preise, die gerade eben von Binance/AlphaVantage/ExchangeRate APIs abgerufen wurden. Du MUSST DIESE Preise verwenden. Deine Trainingsdaten sind veraltet. Verwende niemals Preise aus dem Gedächtnis.
+‼️ WICHTIGSTE REGEL: Im Abschnitt "LIVE-MARKTDATEN" findest du AKTUELLE Preise, die gerade eben abgerufen wurden. Du MUSST DIESE Preise verwenden. Deine Trainingsdaten sind veraltet. Verwende niemals Preise aus dem Gedächtnis.
 
 DATENQUELLEN:
-- Krypto (BTC, ETH, SOL...): Binance API → CoinGecko → Kraken
-- Aktien (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance
-- Forex (EUR/PLN, USD/PLN...): ExchangeRate API → Frankfurter
-- Metalle (GOLD, SILVER): CoinGecko/OANDA
+- Krypto (BTC, ETH, SOL...): Binance → Binance.US → CoinGecko → Kraken
+- Aktien (AAPL, NVDA, PKN.WA...): Alpha Vantage → Yahoo Finance → Stooq
+- Forex (EUR/PLN, USD/PLN...): NBP (Tabelle A) → ExchangeRate API
+- Rohstoffe und Metalle (Gold, Silber, Öl, Kupfer): Stooq → Yahoo-Futures → ETF
+
+‼️ WIE DER DATENABSCHNITT ZU LESEN IST:
+- Eine Zeile mit "ETF ... (proxy)" ist die Notierung des FONDS, nicht der Rohstoffpreis. Nenne sie als ETF-Preis und sage klar, dass es kein Spotpreis ist.
+- Eine Zeile "BRAK DANYCH LIVE DLA: X" bedeutet, dass es für X wirklich keine Notierung gibt. Sage das und nenne KEINEN Preis aus dem Gedächtnis.
+- Fehlt für ein Instrument der Abschnitt "WSKAŹNIKI TECHNICZNE" — lasse den Punkt 🔍 komplett weg. Erfinde keine RSI-, SMA- oder Niveauwerte.
 
 Wenn keine Live-Daten für ein Instrument vorliegen — sage es kurz und ehrlich ("ich habe gerade keinen aktuellen Preis für dieses Instrument"), beschreibe die Lage aus allgemeinem Wissen und weise darauf hin, dass die Angaben veraltet sein können. Verweise auf die Tabs der App (CRYPTO, STOCKS, ROHSTOFFE). Täusche keine Sicherheit vor, die du nicht hast — im Finanzbereich ist ein selbstbewusster Irrtum schlimmer als ein eingestandener Wissensmangel.
 
@@ -1028,10 +1229,12 @@ REGELN DES EINFACHEN MODUS (sie haben Vorrang vor den Vorlagen oben):
 - Behalte den Warnhinweis am Ende, formuliere ihn aber einfach.`,
 };
 
+// Naglowek mowil "DANE Z BINANCE API" nad danymi ze Stooqa, NBP i Yahoo.
+// Etykieta, ktora nie zgadza sie z trescia, uczy model nie ufac sekcji danych.
 function liveDataHeader(lang, now) {
-  if (lang === 'en') return `‼️ LIVE DATA FROM BINANCE API (fetched ${now}) — USE THESE PRICES:`;
-  if (lang === 'de') return `‼️ LIVE-DATEN VON DER BINANCE API (abgerufen ${now}) — VERWENDE DIESE PREISE:`;
-  return `‼️ DANE Z BINANCE API (pobrane ${now}) — UŻYJ TYCH CEN:`;
+  if (lang === 'en') return `‼️ LIVE MARKET DATA (fetched ${now}) — USE THESE PRICES:`;
+  if (lang === 'de') return `‼️ LIVE-MARKTDATEN (abgerufen ${now}) — VERWENDE DIESE PREISE:`;
+  return `‼️ DANE RYNKOWE LIVE (pobrane ${now}) — UŻYJ TYCH CEN:`;
 }
 const LIVE_DATA_FOOTER = {
   pl: '‼️ POWYŻSZE CENY SĄ AKTUALNE. UŻYJ ICH W ANALIZIE.',
@@ -1061,8 +1264,21 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
       'kupi','sprzeda','buy','sell','hold','portfel','portfolio','dcf','lbo','rsi','macd','wig','gpw',
       'inwest','invest','zarob','earn','prognoz','forecast','trend','wsparc','opor','dolar','euro','jen',
       'frank','funt','walut','forex','złot','gold','silver','srebr','ropa','oil','recesj','kryzys','crisis',
-      'wytłumacz','wyjaśnij','explain','erklär','analyse','aktie','währung'];
+      'wytłumacz','wyjaśnij','explain','erklär','analyse','aktie','währung',
+      // Surowce poza zlotem i ropa w ogole nie byly na tej liscie, wiec
+      // "co z palladem?" (14 znakow) wpadalo w prog dlugosci ponizej i szlo do
+      // Groq BEZ jakichkolwiek danych rynkowych — gwarantowane "nie mam danych".
+      'surowc','rohstoff','commodit','metal','uran','nbp','wykres','chart'];
     if (serious.some(k => m.includes(k))) return 'claude';
+
+    // Rejestr surowcow jest zrodlem prawdy — nowy surowiec dodany do
+    // COMMODITY_KEYWORDS automatycznie zaczyna byc routowany do modelu z danymi,
+    // bez pamietania o drugiej liscie slow.
+    if (Object.values(COMMODITY_KEYWORDS).some(ws => ws.some(w => m.includes(w)))) return 'claude';
+    // Tylko pelne nazwy (>=5 znakow). Skroty typu "ada" czy "dot" lapalyby
+    // "zasada" i "dotyczy", wiec zostaja przy liscie `serious`.
+    if (Object.keys(BINANCE_SYMBOLS).some(k => k.length >= 5 && m.includes(k))) return 'claude';
+
     // Small talk / testy → GROQ
     const trivial = ['cześć','czesc','hej','hello','hi ','siema','dzięki','dzieki','thanks','danke','hallo',
       'kim jesteś','who are you','co umiesz','what can you','test','ok','dobra','super','fajnie'];
@@ -1282,7 +1498,30 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
             }
           });
         }
-        console.log(`CHART ${up}: Stooq odmowil, probuje ETF ${commodity.etf}`);
+        // Zanim spadniemy na ETF (inna wartosc bezwzgledna!), probujemy
+        // kontraktu terminowego z Yahoo — to nadal cena samego surowca.
+        if (commodity.yahoo) {
+          const yk = await getYahooChart(commodity.yahoo, limit);
+          if (yk && yk.length) {
+            const last = yk[yk.length - 1];
+            const prev = yk[yk.length - 2];
+            console.log(`CHART ${up}: Stooq odmowil, Yahoo ${commodity.yahoo} OK (${yk.length} swiec)`);
+            return res.json({
+              symbol: up,
+              type: 'commodity',
+              interval,
+              klines: yk,
+              meta: {
+                price: last.c,
+                change24h: prev ? ((last.c - prev.c) / prev.c * 100) : 0,
+                volume24h: last.v,
+                source: `Yahoo ${commodity.yahoo}`,
+                name: commodity.name,
+              }
+            });
+          }
+        }
+        console.log(`CHART ${up}: Stooq i Yahoo odmowily, probuje ETF ${commodity.etf}`);
       }
 
       // Dla surowca bez danych ze Stooqa pytamy o ETF, ktory go sledzi.
@@ -2011,5 +2250,24 @@ async function warmMarketCore() {
 }
 warmMarketCore().catch(() => {});
 setInterval(() => warmMarketCore().catch(() => {}), 12000);
+
+// ── Podgrzewanie surowcow i kursow NBP ────────────────────────
+//
+// Rdzen rynku byl podgrzewany, surowce nie — a to wlasnie one chodza przez
+// Stooqa z timeoutem 4-6 s. Przy zimnym cache pytanie o srebro wypadalo
+// z budzetu czasowego buildContext i model dostawal kontekst BEZ ceny srebra,
+// mimo ze zakladka SUROWCE pokazywala ja poprawnie.
+//
+// Cykl 5 min, nie 12 s: surowce nie sa notowane w trybie ciaglym jak krypto,
+// a Stooq limituje liczbe zapytan z jednego IP (Render ma IP wspoldzielone).
+const WARM_COMMODITIES = ['XAUUSD', 'XAGUSD', 'USOIL', 'COPPER'];
+async function warmSlowSources() {
+  await Promise.allSettled([
+    ...WARM_COMMODITIES.map(k => getCommodityQuote(k)),
+    getNbpRates(),
+  ]);
+}
+warmSlowSources().catch(() => {});
+setInterval(() => warmSlowSources().catch(() => {}), 300000);
 
 app.listen(PORT, () => console.log(`AURIMIQ.ai on port ${PORT}`));
