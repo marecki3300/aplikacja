@@ -44,7 +44,19 @@ function auth(req, res, next) {
 }
 
 // ── Plan check ────────────────────────────────────────────────
-const FREE_LIMIT = 1;
+// Darmowy plan: 5 zapytan powitalnych i koniec, bez odnawialnego limitu
+// dziennego.
+//
+// Powod jest arytmetyczny, nie oszczednosciowy. Mediana konwersji freemium
+// (RevenueCat 2026, 115 tys. aplikacji) to 2,1% w 35. dniu; przy twardym
+// paywallu 10,7%. Przy 2,1% na 141 platnych abonentow trzeba ~6700 instalacji,
+// przy 10,7% — ~1320. Piec razy mniejsza skala dystrybucji przy zerowym
+// budzecie marketingowym decyduje o tym, czy plan jest wykonalny.
+//
+// Piec zapytan zostaje (WELCOME_BONUS), zeby uzytkownik zdazyl zobaczyc, czy
+// produkt jest dobry — zero zapytan psuje oceny w sklepie i poczte pantoflowa.
+// Powrot do starego modelu: FREE_LIMIT=1 w zmiennych srodowiskowych.
+const FREE_LIMIT = process.env.FREE_LIMIT !== undefined ? Number(process.env.FREE_LIMIT) : 0;
 const WELCOME_BONUS = 5;
 // Limity przestawialne zmiennymi srodowiskowymi — zmiana progu nie wymaga
 // deploya. Wartosci domyslne celowo takie jak dotad: obnizenie limitu to
@@ -2307,6 +2319,78 @@ app.post('/api/calculate/lbo', auth, async (req, res) => {
 });
 
 // ── Health + keep-alive ───────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// WIDERRUF — § 356a BGB
+//
+// Od 19.06.2026 kazdy, kto zawiera z niemieckim konsumentem umowe przez
+// interfejs online, musi udostepnic elektroniczna funkcje odstapienia:
+// stale dostepna, wyroznione miejsce, latwo osiagalna. Przepis obejmuje
+// zakupy w aplikacjach i sprzedaz przez platformy, i wprost stanowi, ze
+// nieistotne jest, czy umowa idzie przez wlasna strone, czy przez platforme
+// zewnetrzna — przedsiebiorca ma zapewnic, ze konsument moze z funkcji
+// skorzystac. W odroznieniu od Kundigungsbutton (§ 312k) NIE MA tu wyjatku
+// dla uslug finansowych.
+//
+// Celowo BEZ auth: konsument musi moc odstapic takze wtedy, gdy nie potrafi
+// sie zalogowac. To jest sens tego przepisu.
+// ══════════════════════════════════════════════════════════════
+
+const widerrufSeen = new Map();
+function widerrufThrottled(ip) {
+  const now = Date.now();
+  for (const [k, t] of widerrufSeen) if (now - t > 3600000) widerrufSeen.delete(k);
+  const last = widerrufSeen.get(ip);
+  if (last && now - last < 20000) return true;
+  widerrufSeen.set(ip, now);
+  return false;
+}
+
+app.post('/api/widerruf', async (req, res) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+  if (widerrufThrottled(ip)) {
+    return res.status(429).json({ error: 'Bitte warten Sie einen Moment und versuchen Sie es erneut.' });
+  }
+
+  const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+  const name     = str(req.body?.name, 200);
+  const email    = str(req.body?.email, 200);
+  const contract = str(req.body?.contract, 300);
+  const contact  = str(req.body?.contact, 200);
+  const note     = str(req.body?.note, 2000);
+
+  if (!name || !email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ error: 'Name und eine gültige E-Mail-Adresse sind erforderlich.' });
+  }
+
+  // Numer referencyjny czytelny dla czlowieka — konsument dostaje go od razu
+  // na ekranie, wiec ma dowod zlozenia oswiadczenia nawet gdyby mail nie doszedl.
+  const now = new Date();
+  const ref = 'WR-' + now.toISOString().slice(0, 10).replace(/-/g, '') + '-' +
+              Math.abs([...(email + name + now.toISOString())].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7))
+                .toString(36).toUpperCase().slice(0, 6);
+
+  try {
+    await supabase.from('widerruf').insert({
+      ref, name, email, contract, contact, note,
+      received_at: now.toISOString(),
+      ip,
+    });
+  } catch (e) {
+    // Blad bazy NIE moze uniewaznic oswiadczenia konsumenta — jest ono
+    // skuteczne z chwila zlozenia. Logujemy i potwierdzamy mimo wszystko.
+    console.error('WIDERRUF: zapis do bazy nieudany:', e.message);
+  }
+
+  console.log(`WIDERRUF ${ref} | ${name} <${email}> | ${contract || 'brak wskazania umowy'}`);
+
+  res.json({
+    ok: true,
+    ref,
+    receivedAt: now.toISOString(),
+    message: 'Ihr Widerruf ist bei uns eingegangen. Sie erhalten die Bestätigung per E-Mail.',
+  });
+});
+
 app.get('/health', (_, res) => res.json({ status: 'ok', v: 2, source: 'binance' }));
 
 const SELF = process.env.RENDER_EXTERNAL_URL || 'https://aplikacja-yrql.onrender.com';
