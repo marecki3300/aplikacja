@@ -46,7 +46,20 @@ function auth(req, res, next) {
 // ── Plan check ────────────────────────────────────────────────
 const FREE_LIMIT = 1;
 const WELCOME_BONUS = 5;
-const PLAN_LIMITS = { free: FREE_LIMIT, lite: 25, pro: Infinity };
+// Limity przestawialne zmiennymi srodowiskowymi — zmiana progu nie wymaga
+// deploya. Wartosci domyslne celowo takie jak dotad: obnizenie limitu to
+// zmiana warunkow dla kogos, kto juz zaplacil, i jest decyzja biznesowa,
+// nie techniczna.
+//
+// Kontekst do tej decyzji: przy 25 zapytaniach dziennie plan Lite kosztuje
+// w skrajnym miesiacu ~34 zl, a przynosi 13,13 zl po VAT i prowizji Play.
+// Realny uzytkownik zadaje 2-5 pytan dziennie, wiec problem jest teoretyczny
+// do momentu, w ktorym przestanie byc.
+const PLAN_LIMITS = {
+  free: FREE_LIMIT,
+  lite: Number(process.env.LITE_LIMIT) || 25,
+  pro: Number(process.env.PRO_LIMIT) || Infinity,
+};
 function planLimit(plan) { return PLAN_LIMITS[plan] ?? FREE_LIMIT; }
 function calcRemaining(plan, queries, totalEver) {
   if (plan === 'pro') return 999;
@@ -446,30 +459,23 @@ async function getGpwSummary() {
   });
 }
 
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+// Klucz WYLACZNIE ze srodowiska. Poprzedni literal byl widoczny w publicznym
+// repozytorium, wiec nalezy go traktowac jako spalony. Brak klucza nie psuje
+// akcji — Alpha Vantage jest teraz zrodlem trzecim, za Yahoo i Stooqiem.
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || '';
+if (!AV_KEY) console.log('UWAGA: brak ALPHA_VANTAGE_KEY — akcje ida przez Yahoo i Stooq');
 
 // ── ALPHA VANTAGE — akcje (Mag7 + WIG20) ────────────────────
+// Kolejnosc odwrocona: Yahoo przed Alpha Vantage.
+//
+// Alpha Vantage na darmowym planie daje 25 zapytan na DOBE. Bedac zrodlem
+// pierwszym, wyczerpywal sie w kilkanascie minut ruchu i przez reszte doby
+// kazde zapytanie o akcje placilo pelny timeout za nic, zanim trafilo na
+// Yahoo — ktore jest darmowe, bez klucza i bez limitu dziennego.
+// Teraz Alpha Vantage jest tam, gdzie jego miejsce: jako trzecie zrodlo.
 async function getStockPrice(symbol) {
   return cached(`stock:${symbol}`, 60000, async () => {
-    try {
-      const r = await fetchWithTimeout(
-        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`, {}, 3000
-      );
-      const d = await r.json();
-      const q = d['Global Quote'];
-      if (q && q['05. price']) {
-        return {
-          price: parseFloat(q['05. price']),
-          change24h: parseFloat(q['10. change percent'].replace('%','')),
-          volume24h: parseFloat(q['06. volume']) * parseFloat(q['05. price']),
-          high24h: parseFloat(q['03. high']),
-          low24h: parseFloat(q['04. low']),
-          source: 'AlphaVantage'
-        };
-      }
-    } catch(e) { console.log('AlphaVantage error:', e.message); }
-
-    // Fallback — Yahoo Finance przez proxy
+    // 1. Yahoo Finance — darmowe, bez klucza, zna .WA i .DE
     try {
       const r2 = await fetchWithTimeout(
         `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`,
@@ -490,7 +496,30 @@ async function getStockPrice(symbol) {
         };
       }
     } catch(e2) { console.log('Yahoo error:', e2.message); }
-    return null;
+
+    // 2. Alpha Vantage — tylko gdy klucz jest ustawiony
+    if (AV_KEY) {
+      try {
+        const r = await fetchWithTimeout(
+          `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`, {}, 3000
+        );
+        const d = await r.json();
+        const q = d['Global Quote'];
+        if (q && q['05. price']) {
+          return {
+            price: parseFloat(q['05. price']),
+            change24h: parseFloat(q['10. change percent'].replace('%','')),
+            volume24h: parseFloat(q['06. volume']) * parseFloat(q['05. price']),
+            high24h: parseFloat(q['03. high']),
+            low24h: parseFloat(q['04. low']),
+            source: 'AlphaVantage'
+          };
+        }
+      } catch(e) { console.log('AlphaVantage error:', e.message); }
+    }
+
+    // 3. Stooq — ostatnia deska ratunku, obsluguje i .WA, i tickery US
+    return await getStooqQuote(symbol).catch(() => null);
   });
 }
 
@@ -1250,6 +1279,22 @@ const LIVE_DATA_FOOTER = {
 };
 
 // ── POST /api/chat ────────────────────────────────────────────
+// Szacunek kosztu jednego zapytania w zlotowkach.
+//
+// Ceny Sonnet 5 (sierpien 2026): $2 za milion tokenow wejscia, $10 wyjscia,
+// odczyt z cache to jedna dziesiata wejscia. Kurs domyslny 3,73 PLN/USD;
+// podmienialny zmienna USD_PLN, bo to szacunek do logu, nie ksiegowosc.
+const PRICE_IN  = Number(process.env.PRICE_IN_USD)  || 2;
+const PRICE_OUT = Number(process.env.PRICE_OUT_USD) || 10;
+const USD_PLN   = Number(process.env.USD_PLN)       || 3.73;
+function estimateCostPLN(u = {}) {
+  const inp   = (u.input_tokens || 0)                 * PRICE_IN  / 1e6;
+  const write = (u.cache_creation_input_tokens || 0)  * PRICE_IN  * 1.25 / 1e6;
+  const read  = (u.cache_read_input_tokens || 0)      * PRICE_IN  * 0.1  / 1e6;
+  const out   = (u.output_tokens || 0)                * PRICE_OUT / 1e6;
+  return ((inp + write + read + out) * USD_PLN).toFixed(4) + ' zl';
+}
+
 app.post('/api/chat', auth, checkPlan, async (req, res) => {
   const { messages, lang: rawLang, simple } = req.body;
   const lang = ['pl', 'en', 'de'].includes(rawLang) ? rawLang : 'pl';
@@ -1399,7 +1444,16 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
           const claudeData = await claudeRes.json();
           if (claudeData.content?.[0]?.text) {
             reply = claudeData.content[0].text;
-            console.log('Model: Claude ' + (process.env.CLAUDE_MODEL || 'claude-sonnet-5'));
+            // Realne zuzycie z odpowiedzi API, nie szacunek. Bez tego nie da
+            // sie odpowiedziec na pytanie "ile naprawde kosztuje uzytkownik",
+            // a to jest liczba, od ktorej zalezy sensownosc calego cennika.
+            const u = claudeData.usage || {};
+            console.log(
+              `Model: Claude ${process.env.CLAUDE_MODEL || 'claude-sonnet-5'} | ` +
+              `we: ${u.input_tokens ?? '?'} (cache zapis ${u.cache_creation_input_tokens ?? 0}, ` +
+              `odczyt ${u.cache_read_input_tokens ?? 0}) | wy: ${u.output_tokens ?? '?'} | ` +
+              `koszt: ${estimateCostPLN(u)}`
+            );
           } else {
             console.log('Claude error:', JSON.stringify(claudeData).slice(0, 200));
           }
