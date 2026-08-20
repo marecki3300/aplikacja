@@ -1275,9 +1275,12 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     // COMMODITY_KEYWORDS automatycznie zaczyna byc routowany do modelu z danymi,
     // bez pamietania o drugiej liscie slow.
     if (Object.values(COMMODITY_KEYWORDS).some(ws => ws.some(w => m.includes(w)))) return 'claude';
-    // Tylko pelne nazwy (>=5 znakow). Skroty typu "ada" czy "dot" lapalyby
-    // "zasada" i "dotyczy", wiec zostaja przy liscie `serious`.
-    if (Object.keys(BINANCE_SYMBOLS).some(k => k.length >= 5 && m.includes(k))) return 'claude';
+    // Tickery dopasowujemy jako CALE SLOWO, nie jako podciag. Proste
+    // m.includes() lapaloby "ada" w "zasada" i "dot" w "dotyczy", a odsianie
+    // ich progiem dlugosci wycinalo tez XRP, SOL, BNB i ADA — czyli pytanie
+    // "co z xrp?" (8 znakow) szlo do Groq bez zadnych danych rynkowych.
+    const asWord = k => new RegExp(`(^|[^a-z0-9])${k}([^a-z0-9]|$)`).test(m);
+    if (Object.keys(BINANCE_SYMBOLS).some(asWord)) return 'claude';
 
     // Small talk / testy → GROQ
     const trivial = ['cześć','czesc','hej','hello','hi ','siema','dzięki','dzieki','thanks','danke','hallo',
