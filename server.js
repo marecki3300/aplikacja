@@ -452,8 +452,8 @@ const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
 async function getStockPrice(symbol) {
   return cached(`stock:${symbol}`, 60000, async () => {
     try {
-      const r = await fetch(
-        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+      const r = await fetchWithTimeout(
+        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`, {}, 3000
       );
       const d = await r.json();
       const q = d['Global Quote'];
@@ -471,9 +471,9 @@ async function getStockPrice(symbol) {
 
     // Fallback — Yahoo Finance przez proxy
     try {
-      const r2 = await fetch(
+      const r2 = await fetchWithTimeout(
         `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }, 3000
       );
       const d2 = await r2.json();
       const meta = d2?.chart?.result?.[0]?.meta;
@@ -498,8 +498,8 @@ async function getStockPrice(symbol) {
 async function getForexRate(from, to) {
   return cached(`forex:${from}${to}`, 60000, async () => {
     try {
-      const r = await fetch(
-        `https://api.exchangerate-api.com/v4/latest/${from}`
+      const r = await fetchWithTimeout(
+        `https://api.exchangerate-api.com/v4/latest/${from}`, {}, 3000
       );
       const d = await r.json();
       if (d.rates && d.rates[to]) {
@@ -517,7 +517,7 @@ async function getForexRate(from, to) {
 
     // Fallback — open.er-api.com
     try {
-      const r2 = await fetch(`https://open.er-api.com/v6/latest/${from}`);
+      const r2 = await fetchWithTimeout(`https://open.er-api.com/v6/latest/${from}`, {}, 3000);
       const d2 = await r2.json();
       if (d2.rates && d2.rates[to]) {
         return {
@@ -535,7 +535,7 @@ async function getForexRate(from, to) {
     if (to === 'PLN' || from === 'PLN') {
       try {
         const currency = from === 'PLN' ? to : from;
-        const r3 = await fetch(`https://api.nbp.pl/api/exchangerates/rates/a/${currency}/?format=json`);
+        const r3 = await fetchWithTimeout(`https://api.nbp.pl/api/exchangerates/rates/a/${currency}/?format=json`, {}, 3000);
         const d3 = await r3.json();
         const rate = d3.rates?.[0]?.mid;
         if (rate) {
@@ -577,9 +577,9 @@ async function getUniversalTicker(symbol) {
 async function getBinanceTicker(symbol) {
   return cached(`ticker:${symbol}`, 15000, async () => {
     try {
-      const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+      const r = await fetchWithTimeout(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      });
+      }, 2500);
       if (r.ok) {
         const d = await r.json();
         if (d.lastPrice) {
@@ -597,9 +597,9 @@ async function getBinanceTicker(symbol) {
 
     // 1b. Binance.US — dziala z serwerow USA (Render)
     try {
-      const rus = await fetch(`https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol.replace('USDT','USD')}`, {
+      const rus = await fetchWithTimeout(`https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol.replace('USDT','USD')}`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      });
+      }, 2500);
       if (rus.ok) {
         const d = await rus.json();
         if (d.lastPrice) {
@@ -618,9 +618,10 @@ async function getBinanceTicker(symbol) {
     const cgId = COINGECKO_MAP[symbol];
     if (cgId) {
       try {
-        const r2 = await fetch(
+        const r2 = await fetchWithTimeout(
           `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_high_24h=true&include_low_24h=true`,
-          { headers: { 'Accept': 'application/json', 'User-Agent': 'AURIMIQ/1.0' } }
+          { headers: { 'Accept': 'application/json', 'User-Agent': 'AURIMIQ/1.0' } },
+          3000
         );
         if (r2.ok) {
           const d2 = await r2.json();
@@ -642,7 +643,7 @@ async function getBinanceTicker(symbol) {
     try {
       const krakenBase = symbol.replace('USDT', '').replace('BTC','XBT').replace('DOGE','XDG');
       const krakenSym = krakenBase + 'USD';
-      const r3 = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${krakenSym}`);
+      const r3 = await fetchWithTimeout(`https://api.kraken.com/0/public/Ticker?pair=${krakenSym}`, {}, 3000);
       if (r3.ok) {
         const d3 = await r3.json();
         const pairs = Object.values(d3.result || {});
@@ -669,12 +670,12 @@ async function getBinanceTicker(symbol) {
 
 async function getBinanceChart(symbol, interval, limit) {
   return cached(`chart:${symbol}:${interval}:${limit}`, 60000, async () => {
-    let r = await fetch(
-      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+    let r = await fetchWithTimeout(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, {}, 3000
     ).catch(() => null);
     if (!r || !r.ok) {
-      r = await fetch(
-        `https://api.binance.us/api/v3/klines?symbol=${symbol.replace('USDT','USD')}&interval=${interval}&limit=${limit}`
+      r = await fetchWithTimeout(
+        `https://api.binance.us/api/v3/klines?symbol=${symbol.replace('USDT','USD')}&interval=${interval}&limit=${limit}`, {}, 3000
       ).catch(() => null);
     }
     if (!r || !r.ok) return null;
@@ -742,7 +743,7 @@ async function getTechnicals(symbol) {
 
 async function getFearGreed() {
   return cached('fear_greed', 300000, async () => {
-    const r = await fetch('https://api.alternative.me/fng/?limit=1');
+    const r = await fetchWithTimeout('https://api.alternative.me/fng/?limit=1', {}, 3000);
     const d = await r.json();
     return d.data[0];
   });
@@ -761,8 +762,8 @@ async function getStockData(symbol) {
     }
     // USA: AlphaVantage, fallback Stooq
     try {
-      const r = await fetch(
-        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`
+      const r = await fetchWithTimeout(
+        `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`, {}, 3000
       );
       const d = await r.json();
       const q = d['Global Quote'];
@@ -1530,8 +1531,8 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
       // Dla surowca bez danych ze Stooqa pytamy o ETF, ktory go sledzi.
       const avSymbol = commodity ? commodity.etf : up;
       const size = limit <= 90 ? 'compact' : 'full';
-      const r = await fetch(
-        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${avSymbol}&outputsize=${size}&apikey=${AV_KEY}`
+      const r = await fetchWithTimeout(
+        `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${avSymbol}&outputsize=${size}&apikey=${AV_KEY}`, {}, 6000
       );
       const d = await r.json();
       const ts = d['Time Series (Daily)'];
@@ -2090,9 +2091,9 @@ async function fetchCryptoNews(lang = 'en') {
       try {
         const encoded = encodeURIComponent(query);
         const url = `https://news.google.com/rss/search?q=${encoded}&hl=${loc.hl}&gl=${loc.gl}&ceid=${loc.ceid}`;
-        const r = await fetch(url, {
+        const r = await fetchWithTimeout(url, {
           headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FinAI/2.0)' }
-        });
+        }, 5000);
         if (!r.ok) continue;
         const text = await r.text();
 
