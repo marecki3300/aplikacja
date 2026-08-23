@@ -1812,19 +1812,41 @@ app.get('/api/snapshot/:symbol', auth, async (req, res) => {
   try {
     let quote = null, tech = null;
 
+    // `spark` to same ceny zamkniecia z ostatnich ~40 sesji. Aplikacja rysuje
+    // z nich miniature wykresu w oknie czekania — na telefonie czat i wykres
+    // sa na osobnych zakladkach, wiec bez tego uzytkownik w trakcie odpowiedzi
+    // nie widzi zadnego obrazka, tylko liczby.
+    let closes = null;
+    const SPARK = 40;
+    const toCloses = k => (Array.isArray(k) && k.length > 1
+      ? k.slice(-SPARK).map(x => x.c).filter(Number.isFinite)
+      : null);
+
     if (kind === 'crypto') {
-      [quote, tech] = await Promise.all([
+      const [q, t, k] = await Promise.all([
         getBinanceTicker(sym).catch(() => null),
         getTechnicals(sym).catch(() => null),
+        getBinanceChart(sym, '1d', SPARK).catch(() => null),
       ]);
+      quote = q; tech = t; closes = toCloses(k);
     } else if (kind === 'commodity') {
-      const [q, t] = await Promise.all([
+      const src = COMMODITY_SOURCES[sym] || {};
+      const [q, t, k] = await Promise.all([
         getCommodityQuote(sym).catch(() => null),
         getCommodityTechnicals(sym).catch(() => null),
+        getStooqChart(src.stooq, SPARK).catch(() => null),
       ]);
-      quote = q; tech = t;
+      quote = q; tech = t; closes = toCloses(k);
+      if (!closes && src.yahoo) {
+        closes = toCloses(await getYahooChart(src.yahoo, SPARK).catch(() => null));
+      }
     } else {
-      quote = await getStockPrice(sym).catch(() => null);
+      const [q, k] = await Promise.all([
+        getStockPrice(sym).catch(() => null),
+        getYahooChart(sym, SPARK).catch(() => null),
+      ]);
+      quote = q; closes = toCloses(k);
+      if (!closes) closes = toCloses(await getStooqChart(sym.replace('.WA', '').toLowerCase(), SPARK).catch(() => null));
     }
 
     if (!quote) return res.status(404).json({ error: 'No data' });
@@ -1836,6 +1858,7 @@ app.get('/api/snapshot/:symbol', auth, async (req, res) => {
       change24h: quote.change24h,
       isProxy: quote.isProxy || false,
       tech: tech || null,
+      spark: closes && closes.length > 4 ? closes : null,
     });
   } catch (e) {
     res.status(502).json({ error: e.message });
