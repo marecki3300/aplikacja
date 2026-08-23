@@ -1734,6 +1734,54 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
   }
 });
 
+// ── POST /api/report — zglaszanie odpowiedzi AI ──────────────
+//
+// Wymog polityki Google Play dla aplikacji generujacych tresc AI:
+// "Apps that generate content using AI must contain in-app user reporting
+// or flagging features that allow users to report or flag offensive content
+// to developers without needing to exit the app."
+//
+// Zgloszenie zapisujemy razem z trescia pytania i odpowiedzi, bo bez nich
+// nie da sie ocenic, co poszlo nie tak. Kategoria jest opcjonalna —
+// wymaganie uzasadnienia zniechecaloby do zglaszania.
+const REPORT_REASONS = ['inaccurate', 'offensive', 'harmful', 'advice', 'other'];
+
+app.post('/api/report', auth, async (req, res) => {
+  const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+  const userMessage = str(req.body?.message, 2000);
+  const aiReply     = str(req.body?.reply, 8000);
+  const rawReason   = str(req.body?.reason, 40).toLowerCase();
+  const reason      = REPORT_REASONS.includes(rawReason) ? rawReason : 'other';
+  const note        = str(req.body?.note, 1000);
+  const lang        = ['pl', 'en', 'de'].includes(req.body?.lang) ? req.body.lang : 'pl';
+
+  if (!aiReply) return res.status(400).json({ error: 'Nothing to report' });
+
+  const now = new Date();
+  const ref = 'RP-' + now.toISOString().slice(0, 10).replace(/-/g, '') + '-' +
+              Math.abs([...(req.user.id + aiReply.slice(0, 40) + now.toISOString())]
+                .reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 11))
+                .toString(36).toUpperCase().slice(0, 6);
+
+  try {
+    await supabase.from('ai_reports').insert({
+      ref,
+      user_id: req.user.id,
+      user_message: userMessage,
+      ai_reply: aiReply,
+      reason, note, lang,
+      created_at: now.toISOString(),
+    });
+  } catch (e) {
+    // Uzytkownik ma dostac potwierdzenie nawet gdy baza zawiedzie —
+    // inaczej zglosi to samo piec razy. Tresc zostaje w logu.
+    console.error('REPORT: zapis do bazy nieudany:', e.message);
+  }
+
+  console.log(`REPORT ${ref} | user=${req.user.id} | ${reason} | "${userMessage.slice(0, 60)}"`);
+  res.json({ ok: true, ref });
+});
+
 // ── GET /api/snapshot/:symbol ────────────────────────────────
 //
 // Lekki endpoint: cena, zmiana dobowa i policzone wskazniki, BEZ modelu.
