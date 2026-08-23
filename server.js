@@ -1734,6 +1734,66 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
   }
 });
 
+// ── GET /api/snapshot/:symbol ────────────────────────────────
+//
+// Lekki endpoint: cena, zmiana dobowa i policzone wskazniki, BEZ modelu.
+// Sluzy do wypelnienia okna czekania na odpowiedz AI trescia zamiast
+// animacji — uzytkownik dostaje czesc odpowiedzi, zanim przyjdzie calosc.
+// Nie zuzywa limitu zapytan, bo nie dotyka Claude ani Groq.
+//
+// Przyjmuje symbol w formacie TradingView, ktorego uzywa terminal
+// (OANDA:XAGUSD, BINANCE:BTCUSDT, GPW:KGH), i sam go tlumaczy.
+function parseTvSymbol(raw) {
+  const up = decodeURIComponent(raw || '').toUpperCase();
+  const [prefix, rest] = up.includes(':') ? up.split(':') : ['', up];
+  const bare = rest || up;
+
+  if (prefix === 'BINANCE') return { kind: 'crypto', sym: bare };
+  if (COMMODITY_SOURCES[bare]) return { kind: 'commodity', sym: bare };
+  if (bare === 'NATGASUSD') return { kind: 'commodity', sym: 'NATGAS' };
+  if (prefix === 'GPW')  return { kind: 'stock', sym: bare + '.WA' };
+  if (prefix === 'XETR') return { kind: 'stock', sym: bare + '.DE' };
+  if (prefix === 'NASDAQ' || prefix === 'NYSE') return { kind: 'stock', sym: bare };
+  // Bez prefiksu: para konczaca sie na USDT to krypto, reszta to akcja.
+  if (bare.endsWith('USDT')) return { kind: 'crypto', sym: bare };
+  return { kind: 'stock', sym: bare };
+}
+
+app.get('/api/snapshot/:symbol', auth, async (req, res) => {
+  const { kind, sym } = parseTvSymbol(req.params.symbol);
+  try {
+    let quote = null, tech = null;
+
+    if (kind === 'crypto') {
+      [quote, tech] = await Promise.all([
+        getBinanceTicker(sym).catch(() => null),
+        getTechnicals(sym).catch(() => null),
+      ]);
+    } else if (kind === 'commodity') {
+      const [q, t] = await Promise.all([
+        getCommodityQuote(sym).catch(() => null),
+        getCommodityTechnicals(sym).catch(() => null),
+      ]);
+      quote = q; tech = t;
+    } else {
+      quote = await getStockPrice(sym).catch(() => null);
+    }
+
+    if (!quote) return res.status(404).json({ error: 'No data' });
+
+    res.json({
+      symbol: sym,
+      kind,
+      price: quote.price,
+      change24h: quote.change24h,
+      isProxy: quote.isProxy || false,
+      tech: tech || null,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // ── GET /api/prices ──────────────────────────────────────────
 app.get('/api/prices', auth, async (req, res) => {
   const symbols = (req.query.symbols || 'BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT').split(',');
