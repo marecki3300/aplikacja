@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY || 'OIZANHH0509LUD9H';
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY || '';
 const FREE_LIMIT = 5;
 
 // ── AUTH ────────────────────────────────────────────────────
