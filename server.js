@@ -1552,10 +1552,12 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
               // tokenizacja jest gorsza niz w angielskim, wiec limit bil
               // wczesniej, niz wygladal.
               max_tokens: 2048,
-              // Domyslna temperatura 1.0 daje przy analizie finansowej
-              // rozwlekle, zmienne odpowiedzi. 0.3 trzyma model przy liczbach
-              // z sekcji danych zamiast przy ladnie brzmiacych ogolnikach.
-              temperature: 0.3,
+              // Bez `temperature`. Sonnet 5 odrzuca ten parametr
+              // ("`temperature` is deprecated for this model"), a poniewaz
+              // caly request leci wtedy bledem 400, KAZDA odpowiedz spadala
+              // na Groqa. Model wyglada na dzialajacy, tylko nie jest to
+              // Claude. Trzymanie sie liczb zalatwia prompt systemowy,
+              // ktory i tak nakazuje opierac sie na sekcji danych.
               // Prompt systemowy rozbity na dwa bloki: staly (kilka tysiecy
               // tokenow, identyczny przy kazdym zapytaniu) idzie z cache_control,
               // wiec Anthropic przetwarza go raz zamiast za kazdym razem.
@@ -2145,6 +2147,13 @@ const PLAY_PRODUCTS = {
 const PLAY_ACTIVE_STATES = new Set([
   'SUBSCRIPTION_STATE_ACTIVE',
   'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+  // CANCELED znaczy "wylaczyl odnawianie", a NIE "stracil dostep".
+  // Dokumentacja Google: "Subscription is canceled but not expired yet (...)
+  // The user might still have access (...) Use lineItems.expiry_time".
+  // Bez tego stanu uzytkownik, ktory rezygnuje w polowie oplaconego miesiaca,
+  // tracil dostep natychmiast — czyli okres, za ktory juz zaplacil.
+  // Koniec dostepu wyznacza expiryTime nizej oraz powiadomienie EXPIRED.
+  'SUBSCRIPTION_STATE_CANCELED',
 ]);
 
 let playClientCache = null;
@@ -2182,8 +2191,12 @@ function planFromPlaySubscription(sub) {
   // Przy zmianie planu (upgrade lite→pro) Google dopisuje nowy lineItem
   // na koniec listy, wiec bierzemy ostatni.
   const items = sub.lineItems || [];
-  const productId = items[items.length - 1]?.productId;
-  return PLAY_PRODUCTS[productId] || 'free';
+  const item = items[items.length - 1];
+  // Data wygasniecia rozstrzyga przypadek CANCELED: dostep trwa do niej,
+  // a nie do momentu klikniecia "anuluj".
+  const exp = item?.expiryTime ? Date.parse(item.expiryTime) : NaN;
+  if (Number.isFinite(exp) && exp <= Date.now()) return 'free';
+  return PLAY_PRODUCTS[item?.productId] || 'free';
 }
 
 // Brak potwierdzenia w ciagu 3 dni = Google automatycznie zwraca pieniadze.
