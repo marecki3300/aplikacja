@@ -845,8 +845,10 @@ async function getStockData(symbol) {
       const sq = await getStooqQuote(symbol).catch(() => null);
       if (sq) return sq;
     }
-    // USA: AlphaVantage, fallback Stooq
-    try {
+    // USA: AlphaVantage, fallback Stooq.
+    // Bez klucza pomijamy od razu — inaczej kazde zapytanie o akcje placi
+    // 3 sekundy timeoutu za odpowiedz, ktora i tak bedzie bledem.
+    if (AV_KEY) try {
       const r = await fetchWithTimeout(
         `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${AV_KEY}`, {}, 3000
       );
@@ -1730,6 +1732,36 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
 
       // Dla surowca bez danych ze Stooqa pytamy o ETF, ktory go sledzi.
       const avSymbol = commodity ? commodity.etf : up;
+
+      // Yahoo PRZED Alpha Vantage. Wczesniej wykres akcji amerykanskiej szedl
+      // wylacznie przez Alpha Vantage — bez Yahoo, bez Stooqa, bez zadnego
+      // zapasu. Odkad klucz jest brany tylko ze srodowiska, brak zmiennej
+      // ALPHA_VANTAGE_KEY oznaczal 404 na kazdym wykresie AAPL czy NVDA.
+      // Yahoo jest darmowe, nie wymaga klucza i nie ma limitu dziennego,
+      // wiec to ono powinno byc pierwsze niezaleznie od klucza.
+      const yStock = await getYahooChart(avSymbol, limit);
+      if (yStock && yStock.length) {
+        const yl = yStock[yStock.length - 1];
+        const yp = yStock[yStock.length - 2];
+        return res.json({
+          symbol: up,
+          type: commodity ? 'commodity' : 'stock',
+          interval,
+          klines: yStock,
+          meta: {
+            price: yl.c,
+            change24h: yp ? ((yl.c - yp.c) / yp.c * 100) : 0,
+            volume24h: yl.v,
+            source: commodity ? `ETF ${commodity.etf} (proxy)` : 'Yahoo',
+            ...(commodity ? { name: commodity.name, isProxy: true } : {}),
+          }
+        });
+      }
+
+      // Alpha Vantage dopiero teraz i tylko z kluczem. Bez klucza zapytanie
+      // i tak wrociloby bledem, placac po drodze pelny timeout.
+      if (!AV_KEY) return res.status(404).json({ error: `No stock data for ${sym}` });
+
       const size = limit <= 90 ? 'compact' : 'full';
       const r = await fetchWithTimeout(
         `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${avSymbol}&outputsize=${size}&apikey=${AV_KEY}`, {}, 6000
