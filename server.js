@@ -86,12 +86,12 @@ const PLAN_LIMITS = {
   lite: Number(process.env.LITE_LIMIT) || 25,
   pro: (function () {
     const raw = process.env.PRO_LIMIT;
-    if (raw === undefined || raw === '') return 200;
+    if (raw === undefined || raw === '') return 100;
     const n = Number(raw);
     if (n === 0) return Infinity;                   // swiadome zdjecie sufitu
     // Literowka w zmiennej srodowiskowej nie moze po cichu wylaczyc
     // bezpiecznika - przy niepoprawnej wartosci wracamy do domyslnej.
-    return Number.isFinite(n) && n > 0 ? n : 200;
+    return Number.isFinite(n) && n > 0 ? n : 100;
   })(),
 };
 
@@ -1551,7 +1551,14 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
               // spolki + ryzyka + horyzont) w polowie zdania. W polskim
               // tokenizacja jest gorsza niz w angielskim, wiec limit bil
               // wczesniej, niz wygladal.
-              max_tokens: 2048,
+              // 2048 bylo za malo. W logach produkcyjnych widac `wy: 2048`
+              // co do tokena — czyli odpowiedz zostala UCIETA na limicie,
+              // w polowie zdania. Sonnet 5 dokłada do wyjscia bloki
+              // `thinking`, ktore tez licza sie do max_tokens i tez sa
+              // platne jako wyjscie, wiec na sama tresc zostawalo mniej
+              // niz przy poprzednim modelu. Urwana analiza finansowa jest
+              // gorsza niz drozsza analiza pelna.
+              max_tokens: Number(process.env.CLAUDE_MAX_TOKENS) || 3000,
               // Bez `temperature`. Sonnet 5 odrzuca ten parametr
               // ("`temperature` is deprecated for this model"), a poniewaz
               // caly request leci wtedy bledem 400, KAZDA odpowiedz spadala
@@ -1590,7 +1597,11 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
               `Model: Claude ${process.env.CLAUDE_MODEL || 'claude-sonnet-5'} | ` +
               `we: ${u.input_tokens ?? '?'} (cache zapis ${u.cache_creation_input_tokens ?? 0}, ` +
               `odczyt ${u.cache_read_input_tokens ?? 0}) | wy: ${u.output_tokens ?? '?'} | ` +
-              `koszt: ${estimateCostPLN(u)}`
+              `koszt: ${estimateCostPLN(u)}` +
+              // stop_reason === 'max_tokens' znaczy, ze odpowiedz sie nie
+              // zmiescila. Bez tego w logu widac tylko okragla liczbe wyjscia
+              // i nic nie podpowiada, ze uzytkownik dostal urwane zdanie.
+              (claudeData.stop_reason === 'max_tokens' ? ' | UWAGA: odpowiedz UCIETA na limicie' : '')
             );
           } else {
             console.log('Claude error:', JSON.stringify(claudeData).slice(0, 200));
