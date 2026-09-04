@@ -67,10 +67,40 @@ const WELCOME_BONUS = 5;
 // w skrajnym miesiacu ~34 zl, a przynosi 13,13 zl po VAT i prowizji Play.
 // Realny uzytkownik zadaje 2-5 pytan dziennie, wiec problem jest teoretyczny
 // do momentu, w ktorym przestanie byc.
+//
+// Ta sama arytmetyka dla Niemiec: Lite 5 EUR to 4,20 EUR po VAT 19% i 3,57 EUR
+// po prowizji Play 15%. Przy 0,011-0,014 EUR za zapytanie Lite wychodzi na zero
+// przy ~10 pytaniach dziennie, Pro (12 EUR, czyli 8,57 EUR netto) przy ~23.
+// Niemiecki Lite jest wiec odrobine lepszy od polskiego, nie gorszy - problem
+// nie jest krajem, tylko tym, ze prog 25/dzien lezy powyzej oplacalnosci.
+//
+// Lite zostaje bez zmian: przy realnym uzyciu zarabia, a obnizenie limitu
+// komus, kto juz zaplacil, to zmiana warunkow, nie poprawka techniczna.
+// Pro dostaje sufit, bo "bez limitu" znaczylo dotad rowniez brak sufitu
+// kosztow - jedno konto pytajace 200 razy dziennie kosztuje ~70 EUR
+// miesiecznie przy 8,57 EUR przychodu. To bezpiecznik przeciw automatom,
+// a nie limit produktu: 200 to ponad czterdziestokrotnosc realnego uzycia.
+// PRO_LIMIT=0 w srodowisku przywraca dawne zachowanie bez sufitu.
 const PLAN_LIMITS = {
   free: FREE_LIMIT,
   lite: Number(process.env.LITE_LIMIT) || 25,
-  pro: Number(process.env.PRO_LIMIT) || Infinity,
+  pro: (function () {
+    const raw = process.env.PRO_LIMIT;
+    if (raw === undefined || raw === '') return 200;
+    const n = Number(raw);
+    if (n === 0) return Infinity;                   // swiadome zdjecie sufitu
+    // Literowka w zmiennej srodowiskowej nie moze po cichu wylaczyc
+    // bezpiecznika - przy niepoprawnej wartosci wracamy do domyslnej.
+    return Number.isFinite(n) && n > 0 ? n : 200;
+  })(),
+};
+
+// Komunikat dla Pro po przekroczeniu progu. Celowo NIE jest to zachieta do
+// zakupu - uzytkownik ma juz najwyzszy plan, wiec upsell bylby absurdem.
+const PRO_FAIR_USE = {
+  pl: n => `Osiagnieto dzienny prog uczciwego uzytkowania (${n} zapytan). Odnowi sie jutro. Potrzebujesz wiecej - napisz na aurimiq@proton.me.`,
+  en: n => `Fair-use daily threshold reached (${n} queries). It resets tomorrow. Need more? Write to aurimiq@proton.me.`,
+  de: n => `Faire-Nutzung-Grenze fuer heute erreicht (${n} Anfragen). Sie wird morgen zurueckgesetzt. Mehr noetig? Schreiben Sie an aurimiq@proton.me.`,
 };
 function planLimit(plan) { return PLAN_LIMITS[plan] ?? FREE_LIMIT; }
 function calcRemaining(plan, queries, totalEver) {
@@ -94,6 +124,20 @@ async function checkPlan(req, res, next) {
   req.plan = data?.plan || 'free';
   req.queries = queries;
   req.totalEver = totalEver;
+
+  // Pro omijalo to sprawdzenie calkowicie, wiec PRO_LIMIT byl martwy.
+  if (req.plan === 'pro') {
+    const cap = planLimit('pro');
+    if (Number.isFinite(cap) && queries >= cap) {
+      const l = PRO_FAIR_USE[req.body?.lang] ? req.body.lang : 'en';
+      return res.status(403).json({
+        error: PRO_FAIR_USE[l](cap),
+        upgrade: false,          // ma juz najwyzszy plan
+        plan: 'pro'
+      });
+    }
+    return next();
+  }
 
   if (req.plan !== 'pro') {
     // welcome bonus — pierwsze 5 zapytań w życiu (tylko free)
