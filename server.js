@@ -1573,8 +1573,15 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
           });
 
           const claudeData = await claudeRes.json();
-          if (claudeData.content?.[0]?.text) {
-            reply = claudeData.content[0].text;
+          // Sonnet 5 zwraca bloki mieszane: pierwszym bywa `thinking`, a nie
+          // `text`. Odwolanie do content[0].text dawalo wtedy undefined, wiec
+          // POPRAWNA odpowiedz Claude byla logowana jako "Claude error" i cale
+          // zapytanie spadalo na Groqa. Bierzemy pierwszy blok typu `text`.
+          const textBlock = Array.isArray(claudeData.content)
+            ? claudeData.content.find(b => b?.type === 'text' && b.text)
+            : null;
+          if (textBlock) {
+            reply = textBlock.text;
             // Realne zuzycie z odpowiedzi API, nie szacunek. Bez tego nie da
             // sie odpowiedziec na pytanie "ile naprawde kosztuje uzytkownik",
             // a to jest liczba, od ktorej zalezy sensownosc calego cennika.
