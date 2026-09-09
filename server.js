@@ -427,30 +427,15 @@ async function getCommodityQuote(key) {
 // RSI/SMA/MACD dla srebra czy zlota, a dane techniczne dostawalo wylacznie
 // krypto (getTechnicals chodzi po getBinanceChart). Model albo zmyslal liczby,
 // albo rozmywal odpowiedz ogolnikami.
-async function getCommodityTechnicals(key) {
+async function getCommodityTechnicals(key, lang) {
   const src = COMMODITY_SOURCES[key];
   if (!src) return null;
-  return cached(`techcom:${key}`, 600000, async () => {
+  // Jak wyzej: w cache leza liczby, etykiety dokleja techLine() wg jezyka.
+  const v = await cached(`techcom:${key}`, 600000, async () => {
     const klines = await getStooqChart(src.stooq, 220).catch(() => null);
-    if (!klines || klines.length < 60) return null;
-    const closes = klines.map(k => k.c);
-    const highs = klines.map(k => k.h).filter(isFinite);
-    const lows = klines.map(k => k.l).filter(isFinite);
-    const last = closes[closes.length - 1];
-    const rsi = calcRSI(closes);
-    const sma50 = calcSMA(closes, 50);
-    const sma200 = calcSMA(closes, 200);
-    const macd = calcMACD(closes);
-    const w = [];
-    if (rsi != null) w.push(`RSI(14): ${rsi.toFixed(1)} ${rsi > 70 ? '(wykupienie)' : rsi < 30 ? '(wyprzedanie)' : '(neutralnie)'}`);
-    if (sma50 != null) w.push(`SMA50: $${sma50.toFixed(2)} (cena ${last > sma50 ? 'POWYŻEJ' : 'PONIŻEJ'})`);
-    if (sma200 != null) w.push(`SMA200: $${sma200.toFixed(2)} (cena ${last > sma200 ? 'POWYŻEJ' : 'PONIŻEJ'})${sma50 != null ? (sma50 > sma200 ? ' | złoty krzyż' : ' | krzyż śmierci') : ''}`);
-    if (macd != null) w.push(`MACD: ${macd >= 0 ? '+' : ''}${macd.toFixed(2)} (${macd >= 0 ? 'byczo' : 'niedźwiedzio'})`);
-    if (highs.length >= 30 && lows.length >= 30) {
-      w.push(`Opór 30d: $${Math.max(...highs.slice(-30)).toFixed(2)} | Wsparcie 30d: $${Math.min(...lows.slice(-30)).toFixed(2)}`);
-    }
-    return w.length ? w.join('\n') : null;
+    return techValues(klines);
   });
+  return v ? techLine(v, lang) : null;
 }
 
 // Slowa kluczowe w trzech jezykach → symbol surowca.
@@ -804,26 +789,70 @@ function calcMACD(closes) {
   if (e12 == null || e26 == null) return null;
   return e12 - e26;
 }
-async function getTechnicals(symbol) {
-  return cached(`tech:${symbol}`, 120000, async () => {
+// ── Wskazniki techniczne: liczby w cache, jezyk dopiero przy renderowaniu ──
+//
+// Wczesniej obie funkcje zwracaly GOTOWY string po polsku i taki string
+// ladowal do cache. Terminal wkleja go do okna czekania (fillSnapshot),
+// wiec Niemiec przy kazdym pytaniu widzial "Opor 30d" i "(neutralnie)"
+// w swoim niemieckim interfejsie. Cache trzyma teraz surowe liczby,
+// a etykiety dobiera techLine() na podstawie jezyka zadania — dzieki temu
+// jeden wpis w cache obsluguje wszystkie trzy jezyki.
+const TECH_LABELS = {
+  pl: { ob:'wykupienie', os:'wyprzedanie', nu:'neutralnie', price:'cena',
+        above:'POWYŻEJ', below:'PONIŻEJ', gc:'złoty krzyż', dc:'krzyż śmierci',
+        bull:'byczo', bear:'niedźwiedzio', res:'Opór 30d', sup:'Wsparcie 30d' },
+  en: { ob:'overbought', os:'oversold', nu:'neutral', price:'price',
+        above:'ABOVE', below:'BELOW', gc:'golden cross', dc:'death cross',
+        bull:'bullish', bear:'bearish', res:'Resistance 30d', sup:'Support 30d' },
+  de: { ob:'überkauft', os:'überverkauft', nu:'neutral', price:'Kurs',
+        above:'ÜBER', below:'UNTER', gc:'goldenes Kreuz', dc:'Todeskreuz',
+        bull:'bullisch', bear:'bärisch', res:'Widerstand 30T', sup:'Unterstützung 30T' },
+};
+
+const TECH_HEADER = {
+  pl: 'WSKAŹNIKI TECHNICZNE (policzone)',
+  en: 'TECHNICAL INDICATORS (computed)',
+  de: 'TECHNISCHE INDIKATOREN (berechnet)',
+};
+
+function techLine(v, lang) {
+  const L = TECH_LABELS[lang] || TECH_LABELS.en;
+  const w = [];
+  if (v.rsi != null) w.push(`RSI(14): ${v.rsi.toFixed(1)} (${v.rsi > 70 ? L.ob : v.rsi < 30 ? L.os : L.nu})`);
+  if (v.sma50 != null) w.push(`SMA50: $${v.sma50.toFixed(2)} (${L.price} ${v.last > v.sma50 ? L.above : L.below})`);
+  if (v.sma200 != null) w.push(`SMA200: $${v.sma200.toFixed(2)} (${L.price} ${v.last > v.sma200 ? L.above : L.below})`
+    + (v.sma50 != null ? (v.sma50 > v.sma200 ? ` | ${L.gc}` : ` | ${L.dc}`) : ''));
+  if (v.macd != null) w.push(`MACD: ${v.macd >= 0 ? '+' : ''}${v.macd.toFixed(2)} (${v.macd >= 0 ? L.bull : L.bear})`);
+  if (v.hi30 != null && v.lo30 != null) w.push(`${L.res}: $${v.hi30.toFixed(2)} | ${L.sup}: $${v.lo30.toFixed(2)}`);
+  return w.length ? w.join('\n') : null;
+}
+
+function techValues(klines, needLevels) {
+  if (!klines || klines.length < 60) return null;
+  const closes = klines.map(k => k.c);
+  const highs = klines.map(k => k.h).filter(isFinite);
+  const lows = klines.map(k => k.l).filter(isFinite);
+  const v = {
+    last: closes[closes.length - 1],
+    rsi: calcRSI(closes),
+    sma50: calcSMA(closes, 50),
+    sma200: calcSMA(closes, 200),
+    macd: calcMACD(closes),
+    hi30: null, lo30: null,
+  };
+  if (highs.length >= 30 && lows.length >= 30) {
+    v.hi30 = Math.max(...highs.slice(-30));
+    v.lo30 = Math.min(...lows.slice(-30));
+  }
+  return v;
+}
+
+async function getTechnicals(symbol, lang) {
+  const v = await cached(`tech:${symbol}`, 120000, async () => {
     const klines = await getBinanceChart(symbol, '1d', 220);
-    if (!klines || klines.length < 60) return null;
-    const closes = klines.map(k => k.c);
-    const highs = klines.map(k => k.h), lows = klines.map(k => k.l);
-    const last = closes[closes.length - 1];
-    const rsi = calcRSI(closes);
-    const sma50 = calcSMA(closes, 50);
-    const sma200 = calcSMA(closes, 200);
-    const macd = calcMACD(closes);
-    const hi30 = Math.max(...highs.slice(-30)), lo30 = Math.min(...lows.slice(-30));
-    const w = [];
-    if (rsi != null) w.push(`RSI(14): ${rsi.toFixed(1)} ${rsi>70?'(wykupienie)':rsi<30?'(wyprzedanie)':'(neutralnie)'}`);
-    if (sma50 != null) w.push(`SMA50: $${sma50.toFixed(2)} (cena ${last>sma50?'POWYŻEJ':'PONIŻEJ'})`);
-    if (sma200 != null) w.push(`SMA200: $${sma200.toFixed(2)} (cena ${last>sma200?'POWYŻEJ':'PONIŻEJ'})${sma50!=null?(sma50>sma200?' | złoty krzyż':' | krzyż śmierci'):''}`);
-    if (macd != null) w.push(`MACD: ${macd>=0?'+':''}${macd.toFixed(2)} (${macd>=0?'byczo':'niedźwiedzio'})`);
-    w.push(`Opór 30d: $${hi30.toFixed(2)} | Wsparcie 30d: $${lo30.toFixed(2)}`);
-    return w.join('\n');
+    return techValues(klines);
   });
+  return v ? techLine(v, lang) : null;
 }
 
 async function getFearGreed() {
@@ -903,7 +932,7 @@ function mentionsInstrument(text) {
 // zadnego instrumentu. Inaczej pytanie o zloto po pytaniu o srebro
 // ciagneloby za soba srebro i marnowalo budzet czasowy na pobieranie
 // czegos, o co juz nikt nie pyta.
-async function buildContext(message, prevMsg = '') {
+async function buildContext(message, prevMsg = '', lang = 'pl') {
   const msg = (mentionsInstrument(message) ? message : message + ' ' + prevMsg).toLowerCase();
   const parts = [`CZAS: ${new Date().toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}`];
   const promises = [];
@@ -977,8 +1006,8 @@ async function buildContext(message, prevMsg = '') {
     // Wskaźniki techniczne dla wykrytego symbolu — AI dostaje policzone RSI/SMA/MACD
     if (mentioned) {
       promises.push(
-        getTechnicals(binSym).then(t => {
-          if (t) parts.push(`WSKAŹNIKI TECHNICZNE ${binSym} (policzone z danych 1D):\n${t}`);
+        getTechnicals(binSym, lang).then(t => {
+          if (t) parts.push(`${TECH_HEADER[lang] || TECH_HEADER.en} ${binSym} (1D):\n${t}`);
         }).catch(() => {})
       );
     }
@@ -1009,8 +1038,8 @@ async function buildContext(message, prevMsg = '') {
       // Wskazniki liczone z tych samych swiec co dla krypto — inaczej prompt
       // TYPU A prosil o RSI/SMA/MACD, ktorych model dla surowca nie dostawal.
       promises.push(
-        getCommodityTechnicals(key).then(t => {
-          if (t) parts.push(`WSKAŹNIKI TECHNICZNE ${key} (policzone z danych 1D):\n${t}`);
+        getCommodityTechnicals(key, lang).then(t => {
+          if (t) parts.push(`${TECH_HEADER[lang] || TECH_HEADER.en} ${key} (1D):\n${t}`);
         }).catch(() => {})
       );
       // Zloto i srebro chodza parami — przy pytaniu o jedno warto miec drugie,
@@ -1522,7 +1551,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     if (route === 'claude' && !reply) {
       let context = null;
       try {
-        context = await buildContext(lastMsg, prevUserMsg);
+        context = await buildContext(lastMsg, prevUserMsg, lang);
       } catch (ctxErr) {
         console.log('buildContext error (kontynuuję bez danych):', ctxErr.message);
       }
@@ -1905,6 +1934,11 @@ function parseTvSymbol(raw) {
 
 app.get('/api/snapshot/:symbol', auth, async (req, res) => {
   const { kind, sym } = parseTvSymbol(req.params.symbol);
+  // Okno czekania w terminalu pokazuje ten string uzytkownikowi wprost,
+  // wiec musi byc w JEGO jezyku. Brak parametru = angielski, nie polski:
+  // starsze klienty i tak nie znaja tego pola, a angielski jest czytelny
+  // dla wiekszej czesci swiata niz polski.
+  const lang = ['pl', 'en', 'de'].includes(req.query.lang) ? req.query.lang : 'en';
   try {
     let quote = null, tech = null;
 
@@ -1921,7 +1955,7 @@ app.get('/api/snapshot/:symbol', auth, async (req, res) => {
     if (kind === 'crypto') {
       const [q, t, k] = await Promise.all([
         getBinanceTicker(sym).catch(() => null),
-        getTechnicals(sym).catch(() => null),
+        getTechnicals(sym, lang).catch(() => null),
         getBinanceChart(sym, '1d', SPARK).catch(() => null),
       ]);
       quote = q; tech = t; closes = toCloses(k);
@@ -1929,7 +1963,7 @@ app.get('/api/snapshot/:symbol', auth, async (req, res) => {
       const src = COMMODITY_SOURCES[sym] || {};
       const [q, t, k] = await Promise.all([
         getCommodityQuote(sym).catch(() => null),
-        getCommodityTechnicals(sym).catch(() => null),
+        getCommodityTechnicals(sym, lang).catch(() => null),
         getStooqChart(src.stooq, SPARK).catch(() => null),
       ]);
       quote = q; tech = t; closes = toCloses(k);
