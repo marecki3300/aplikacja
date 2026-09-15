@@ -1,4 +1,37 @@
+# ── Zaleznosci i logi ────────────────────────────────────────────────
 node_modules/
+*.log
+
+# ── Sekrety ──────────────────────────────────────────────────────────
+# To jest repozytorium PUBLICZNE i backend czyta z niego dziewiec
+# sekretow. Ponizsze wzorce sa tu po to, zeby zaden z nich nigdy nie
+# trafil do commita przez przypadek — nawet jesli plik pojawi sie
+# w folderze pod nieoczekiwana nazwa.
 .env
 .env.*
-*.log
+*.pem
+*.p12
+*.jks
+*.keystore
+keystore.properties
+service-account*.json
+google-play*.json
+*credentials*.json
+*secret*.json
+
+# ── Katalog roboczy po zdalnych operacjach gita ───────────────────────
+# Shell pomostowy nie ma na Windowsie prawa kasowac plikow, wiec blokady
+# gita (index.lock, HEAD.lock) sa tam PRZENOSZONE zamiast usuwane.
+# Mozna skasowac caly katalog recznie, nic od niego nie zalezy.
+_tmp_git/
+
+# ── Smieci ───────────────────────────────────────────────────────────
+# Pusty plik powstaly po sklejeniu dwoch komend w jedna linie w cmd.
+adb
+# Katalog roboczy narzedzi AI — nie jest czescia backendu.
+Claude outputs/
+
+# ── Systemowe ────────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini
