@@ -281,10 +281,15 @@ async function getStooqChart(stooqSym, limit = 90) {
         { headers: { 'User-Agent': 'Mozilla/5.0' } },
         6000
       );
-      if (!r.ok) return null;
+      // Ponizsze trzy sciezki wracaly null BEZ SLADU w logu, wiec z zewnatrz
+      // nie dalo sie odroznic "Stooq zablokowal Rendera" od "symbol nie istnieje".
+      if (!r.ok) { console.log(`Stooq chart ${stooqSym}: HTTP ${r.status}`); return null; }
       const csv = await r.text();
       // Przy nieznanym symbolu Stooq oddaje strone HTML albo "No data".
-      if (!csv || csv.startsWith('<') || !csv.includes('Date')) return null;
+      if (!csv || csv.startsWith('<') || !csv.includes('Date')) {
+        console.log(`Stooq chart ${stooqSym}: odpowiedz bez danych [${(csv || '').slice(0, 80).replace(/\s+/g, ' ')}]`);
+        return null;
+      }
 
       const rows = csv.trim().split('\n').slice(1).filter(x => x.includes(','));
       const klines = rows.map(line => {
@@ -297,7 +302,8 @@ async function getStooqChart(stooqSym, limit = 90) {
         };
       }).filter(k => isFinite(k.c) && isFinite(k.t));
 
-      return klines.length ? klines.slice(-limit) : null;
+      if (!klines.length) { console.log(`Stooq chart ${stooqSym}: CSV bez poprawnych swiec`); return null; }
+      return klines.slice(-limit);
     } catch (e) {
       console.log(`Stooq chart ${stooqSym}: ${e.message}`);
       return null;
@@ -432,7 +438,21 @@ async function getCommodityTechnicals(key, lang) {
   if (!src) return null;
   // Jak wyzej: w cache leza liczby, etykiety dokleja techLine() wg jezyka.
   const v = await cached(`techcom:${key}`, 600000, async () => {
-    const klines = await getStooqChart(src.stooq, 220).catch(() => null);
+    // Wskazniki szly WYLACZNIE ze Stooqa i nie mialy zadnego zrodla zapasowego.
+    // Gdy Stooq nie odpowiada — a robi to CICHO, zwracajac null zamiast rzucac
+    // wyjatkiem — uzytkownik dostawal cene surowca (zejscie na ETF dziala),
+    // ale bez RSI, MACD i srednich. Wykres mial juz drugi stopien na swiecach
+    // z Yahoo; wskazniki nie mialy go wcale, wiec funkcja po cichu znikala.
+    // Prog 60 swiec nie jest przypadkowy — techValues() ponizej tej liczby
+    // i tak zwraca null, wiec krotka seria ze Stooqa jest warta tyle co brak.
+    let klines = await getStooqChart(src.stooq, 220).catch(() => null);
+    if ((!klines || klines.length < 60) && src.yahoo) {
+      const yk = await getYahooChart(src.yahoo, 220).catch(() => null);
+      if (yk && yk.length >= 60) {
+        console.log(`TECH ${key}: Stooq bez danych, wskazniki licze z Yahoo ${src.yahoo} (${yk.length} swiec)`);
+        klines = yk;
+      }
+    }
     return techValues(klines);
   });
   return v ? techLine(v, lang) : null;
