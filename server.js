@@ -248,7 +248,12 @@ async function getStooqQuote(symbol) {
     const d2 = now.toISOString().slice(0,10).replace(/-/g,'');
     const d1 = new Date(now - 10*864e5).toISOString().slice(0,10).replace(/-/g,'');
     const r = await fetchWithTimeout(`https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+        'Accept': 'text/csv,text/plain,*/*',
+        'Accept-Language': 'pl,en;q=0.8',
+        'Referer': `https://stooq.com/q/d/?s=${stooqSym}`,
+      }
     }, 5000);
     if (!r.ok) return null;
     const csv = await r.text();
@@ -278,7 +283,12 @@ async function getStooqChart(stooqSym, limit = 90) {
       const d1 = new Date(now - (limit + 40) * 864e5).toISOString().slice(0, 10).replace(/-/g, '');
       const r = await fetchWithTimeout(
         `https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' } },
+        { headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+            'Accept': 'text/csv,text/plain,*/*',
+            'Accept-Language': 'pl,en;q=0.8',
+            'Referer': `https://stooq.com/q/d/?s=${stooqSym}`,
+          } },
         6000
       );
       // Ponizsze trzy sciezki wracaly null BEZ SLADU w logu, wiec z zewnatrz
@@ -287,7 +297,8 @@ async function getStooqChart(stooqSym, limit = 90) {
       const csv = await r.text();
       // Przy nieznanym symbolu Stooq oddaje strone HTML albo "No data".
       if (!csv || csv.startsWith('<') || !csv.includes('Date')) {
-        console.log(`Stooq chart ${stooqSym}: odpowiedz bez danych [${(csv || '').slice(0, 80).replace(/\s+/g, ' ')}]`);
+        const tytul = ((csv || '').match(/<title[^>]*>([\s\S]{0,160}?)<\/title>/i) || [])[1];
+        console.log(`Stooq chart ${stooqSym}: odpowiedz bez danych | title="${(tytul || '(brak)').trim()}" | ${(csv || '').slice(0, 120).replace(/\s+/g, ' ')}`);
         return null;
       }
 
@@ -666,45 +677,15 @@ async function getUniversalTicker(symbol) {
 
 async function getBinanceTicker(symbol) {
   return cached(`ticker:${symbol}`, 15000, async () => {
-    try {
-      const r = await fetchWithTimeout(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      }, 2500);
-      if (r.ok) {
-        const d = await r.json();
-        if (d.lastPrice) {
-          return {
-            price: parseFloat(d.lastPrice),
-            change24h: parseFloat(d.priceChangePercent),
-            volume24h: parseFloat(d.quoteVolume),
-            high24h: parseFloat(d.highPrice),
-            low24h: parseFloat(d.lowPrice),
-            source: 'Binance'
-          };
-        }
-      }
-    } catch(e) { console.log('Binance error:', e.message); }
+    // KOLEJNOSC ZRODEL — zmieniona po tym, co pokazaly logi Rendera.
+    // Wczesniej lancuch zaczynal sie od Binance, ale ani api.binance.com,
+    // ani api.binance.us nie odpowiadaja z tej infrastruktury: kazde
+    // zapytanie placilo 2,5 s + 2,5 s timeoutu, zanim doszlo do CoinGecko,
+    // ktory i tak obslugiwal wszystko. Teraz pierwsze ida zrodla, ktore
+    // stad realnie dzialaja. Binance zostaje na koncu, a nie wylatuje, bo
+    // gdyby kiedys wrocil, ma najlepsze dane: wolumen i zakres prosto z gieldy.
 
-    // 1b. Binance.US — dziala z serwerow USA (Render)
-    try {
-      const rus = await fetchWithTimeout(`https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol.replace('USDT','USD')}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-      }, 2500);
-      if (rus.ok) {
-        const d = await rus.json();
-        if (d.lastPrice) {
-          return {
-            price: parseFloat(d.lastPrice),
-            change24h: parseFloat(d.priceChangePercent),
-            volume24h: parseFloat(d.quoteVolume),
-            high24h: parseFloat(d.highPrice),
-            low24h: parseFloat(d.lowPrice),
-            source: 'Binance.US'
-          };
-        }
-      }
-    } catch(eus) { console.log('Binance.US error:', eus.message); }
-
+    // 1. CoinGecko
     const cgId = COINGECKO_MAP[symbol];
     if (cgId) {
       try {
@@ -730,6 +711,8 @@ async function getBinanceTicker(symbol) {
       } catch(e2) { console.log('CoinGecko error:', e2.message); }
     }
 
+    // 2. Kraken — drugie zrodlo dzialajace z Rendera; obsluguje tez symbole,
+    //    ktorych nie ma w COINGECKO_MAP.
     try {
       const krakenBase = symbol.replace('USDT', '').replace('BTC','XBT').replace('DOGE','XDG');
       const krakenSym = krakenBase + 'USD';
@@ -753,6 +736,46 @@ async function getBinanceTicker(symbol) {
         }
       }
     } catch(e3) { console.log('Kraken error:', e3.message); }
+
+    // 3. Binance
+    try {
+      const r = await fetchWithTimeout(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      }, 2500);
+      if (r.ok) {
+        const d = await r.json();
+        if (d.lastPrice) {
+          return {
+            price: parseFloat(d.lastPrice),
+            change24h: parseFloat(d.priceChangePercent),
+            volume24h: parseFloat(d.quoteVolume),
+            high24h: parseFloat(d.highPrice),
+            low24h: parseFloat(d.lowPrice),
+            source: 'Binance'
+          };
+        }
+      }
+    } catch(e) { console.log('Binance error:', e.message); }
+
+    // 4. Binance.US
+    try {
+      const rus = await fetchWithTimeout(`https://api.binance.us/api/v3/ticker/24hr?symbol=${symbol.replace('USDT','USD')}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      }, 2500);
+      if (rus.ok) {
+        const d = await rus.json();
+        if (d.lastPrice) {
+          return {
+            price: parseFloat(d.lastPrice),
+            change24h: parseFloat(d.priceChangePercent),
+            volume24h: parseFloat(d.quoteVolume),
+            high24h: parseFloat(d.highPrice),
+            low24h: parseFloat(d.lowPrice),
+            source: 'Binance.US'
+          };
+        }
+      }
+    } catch(eus) { console.log('Binance.US error:', eus.message); }
 
     return null;
   });
