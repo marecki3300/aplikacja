@@ -241,7 +241,30 @@ function fetchWithTimeout(url, opts = {}, ms = 5000) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
+// ── Bezpiecznik Stooqa ───────────────────────────────────────
+// Od wrzesnia 2026 Stooq oddaje serwerom (Render) strone z wyzwaniem JavaScript
+// (<noscript>) zamiast CSV. Naglowki przegladarki tego nie obchodza — trzeba
+// wykonac JS. Kazde zapytanie konczylo sie wiec porazka po pelnym czasie
+// odpowiedzi i jedna linijka w logu, dla kazdego symbolu, co piec minut.
+// Po wykryciu wyzwania wylaczamy Stooqa na STOOQ_PAUSE_MS: zero zapytan,
+// jedna linijka w logu, a wywolujacy od razu ida do Yahoo.
+const STOOQ_PAUSE_MS = 30 * 60 * 1000;
+let stooqBlockedUntil = 0;
+function stooqBlocked() { return Date.now() < stooqBlockedUntil; }
+function isStooqChallenge(body) {
+  return typeof body === 'string' && body.startsWith('<') && /<noscript/i.test(body);
+}
+function markStooqBlocked(where) {
+  if (!stooqBlocked()) {
+    console.log(`STOOQ: wyzwanie JS (${where}) — Stooq wylaczony na ${STOOQ_PAUSE_MS / 60000} min, dane z Yahoo`);
+  }
+  stooqBlockedUntil = Date.now() + STOOQ_PAUSE_MS;
+}
+// Stooq trzyma WIG20 i WIG bez sufiksu, Yahoo z sufiksem .WA.
+const YAHOO_INDEX_MAP = { 'WIG20': 'WIG20.WA', 'WIG': 'WIG.WA' };
+
 async function getStooqQuote(symbol) {
+  if (stooqBlocked()) return null;
   return cached(`stooq:${symbol}`, 300000, async () => {
     const stooqSym = STOOQ_MAP[symbol] || (symbol.endsWith('.WA') ? symbol.replace('.WA','').toLowerCase() : symbol.toLowerCase() + '.us');
     const now = new Date();
@@ -257,6 +280,7 @@ async function getStooqQuote(symbol) {
     }, 5000);
     if (!r.ok) return null;
     const csv = await r.text();
+    if (isStooqChallenge(csv)) { markStooqBlocked(`quote ${stooqSym}`); return null; }
     const rows = csv.trim().split('\n').slice(1).filter(x => x.includes(','));
     if (rows.length < 2) return null;
     const last = rows[rows.length-1].split(',');
@@ -275,6 +299,7 @@ async function getStooqQuote(symbol) {
 // Wykres dzienny ze Stooqa — obsluguje i GPW, i surowce.
 // Zwraca null zamiast rzucac, zeby wywolujacy mogl siegnac po zrodlo awaryjne.
 async function getStooqChart(stooqSym, limit = 90) {
+  if (stooqBlocked()) return null;
   return cached(`stooqchart:${stooqSym}:${limit}`, 300000, async () => {
     try {
       const now = new Date();
@@ -295,6 +320,7 @@ async function getStooqChart(stooqSym, limit = 90) {
       // nie dalo sie odroznic "Stooq zablokowal Rendera" od "symbol nie istnieje".
       if (!r.ok) { console.log(`Stooq chart ${stooqSym}: HTTP ${r.status}`); return null; }
       const csv = await r.text();
+      if (isStooqChallenge(csv)) { markStooqBlocked(`chart ${stooqSym}`); return null; }
       // Przy nieznanym symbolu Stooq oddaje strone HTML albo "No data".
       if (!csv || csv.startsWith('<') || !csv.includes('Date')) {
         const tytul = ((csv || '').match(/<title[^>]*>([\s\S]{0,160}?)<\/title>/i) || [])[1];
@@ -508,15 +534,34 @@ function fmtFx(pick, codes) {
 // GPW summary — JEDNO zapytanie Stooq o wiele symboli naraz
 async function getGpwSummary() {
   return cached('gpw:summary', 300000, async () => {
-    const syms = 'wig20 pkn pko pzu ale cdr';
-    const r = await fetchWithTimeout(
-      `https://stooq.com/q/l/?s=${encodeURIComponent(syms)}&f=sd2t2ohlcv&h&e=csv`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' } }, 5000
-    );
-    if (!r.ok) return null;
-    const csv = await r.text();
-    const rows = csv.trim().split('\n').slice(1);
     const names = { WIG20:'INDEKS WIG20', PKN:'ORLEN (PKN)', PKO:'PKO BP', PZU:'PZU', ALE:'ALLEGRO', CDR:'CD PROJEKT' };
+    let csv = null;
+    if (!stooqBlocked()) {
+      const syms = 'wig20 pkn pko pzu ale cdr';
+      const r = await fetchWithTimeout(
+        `https://stooq.com/q/l/?s=${encodeURIComponent(syms)}&f=sd2t2ohlcv&h&e=csv`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }, 5000
+      ).catch(() => null);
+      if (r && r.ok) {
+        csv = await r.text();
+        if (isStooqChallenge(csv)) { markStooqBlocked('gpw summary'); csv = null; }
+      }
+    }
+    if (!csv) {
+      // Awaryjnie Yahoo. Zmiana liczona wzgledem poprzedniego zamkniecia,
+      // nie otwarcia — dlatego inny opis niz w wersji ze Stooqa.
+      const out = [];
+      for (const k of Object.keys(names)) {
+        const ysym = k === 'WIG20' ? 'WIG20.WA' : `${k}.WA`;
+        const q = await getYahooQuote(ysym).catch(() => null);
+        if (!q || !isFinite(q.price)) continue;
+        const unit = k === 'WIG20' ? 'pkt' : 'PLN';
+        const chg = isFinite(q.change24h) ? q.change24h : null;
+        out.push(`${names[k]}: ${q.price.toFixed(2)} ${unit}${chg!==null ? ` | zmiana dzienna: ${chg>=0?'+':''}${chg.toFixed(2)}%` : ''}`);
+      }
+      return out.length ? 'GPW:\n' + out.join('\n') : null;
+    }
+    const rows = csv.trim().split('\n').slice(1);
     const out = [];
     for (const row of rows) {
       const c = row.split(',');
@@ -916,6 +961,8 @@ async function getStockData(symbol) {
     if (symbol.endsWith('.WA') || symbol.startsWith('WIG')) {
       const sq = await getStooqQuote(symbol).catch(() => null);
       if (sq) return sq;
+      const yq = await getYahooQuote(YAHOO_INDEX_MAP[symbol] || symbol).catch(() => null);
+      if (yq) return yq;
     }
     // USA: AlphaVantage, fallback Stooq.
     // Bez klucza pomijamy od razu — inaczej kazde zapytanie o akcje placi
@@ -1755,7 +1802,13 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
       if (STOOQ_MAP[up] || up.endsWith('.WA') || up.endsWith('.DE')) {
         const stooqSym = STOOQ_MAP[up]
           || (up.endsWith('.WA') ? up.replace('.WA', '').toLowerCase() : up.toLowerCase());
-        const klines = await getStooqChart(stooqSym, limit);
+        let klines = await getStooqChart(stooqSym, limit);
+        let source = up.endsWith('.DE') ? 'Stooq/XETRA' : 'Stooq/GPW';
+        if (!klines) {
+          // Yahoo zna .WA i .DE pod tym samym symbolem; indeksy WIG z sufiksem .WA.
+          klines = await getYahooChart(YAHOO_INDEX_MAP[up] || up, limit).catch(() => null);
+          source = up.endsWith('.DE') ? 'Yahoo/XETRA' : 'Yahoo/GPW';
+        }
         if (!klines) return res.status(404).json({ error: `No exchange data for ${sym}` });
 
         const last = klines[klines.length - 1];
@@ -1769,7 +1822,7 @@ app.get('/api/chart/:symbol', auth, async (req, res) => {
             price: last.c,
             change24h: prev ? ((last.c - prev.c) / prev.c * 100) : 0,
             volume24h: last.v,
-            source: up.endsWith('.DE') ? 'Stooq/XETRA' : 'Stooq/GPW',
+            source,
           }
         });
       }
