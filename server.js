@@ -58,6 +58,29 @@ function auth(req, res, next) {
 // Powrot do starego modelu: FREE_LIMIT=1 w zmiennych srodowiskowych.
 const FREE_LIMIT = process.env.FREE_LIMIT !== undefined ? Number(process.env.FREE_LIMIT) : 0;
 const WELCOME_BONUS = 5;
+
+// ── Przelacznik platnosci (zawieszenie dzialalnosci) ─────────
+// PAYMENTS_ENABLED=false na Renderze wylacza sprzedaz: Stripe Checkout
+// odmawia, a apka i terminal chowaja przyciski UPGRADE.
+// Brak zmiennej = platnosci wlaczone, wiec sam deploy niczego nie zmienia.
+//
+// Bez platnosci twardy paywall (FREE_LIMIT=0) bylby slepa uliczka:
+// uzytkownik po 5 zapytaniach powitalnych nie moglby ani pytac, ani kupic.
+// Dlatego w tym trybie darmowe konto dostaje dzienny limit
+// FREE_LIMIT_NO_PAYMENTS (domyslnie 3).
+const PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED !== 'false';
+const FREE_LIMIT_NO_PAYMENTS = (function () {
+  const n = Number(process.env.FREE_LIMIT_NO_PAYMENTS);
+  return Number.isFinite(n) && n >= 0 && process.env.FREE_LIMIT_NO_PAYMENTS !== undefined && process.env.FREE_LIMIT_NO_PAYMENTS !== '' ? n : 3;
+})();
+const FREE_DAILY = PAYMENTS_ENABLED ? FREE_LIMIT : FREE_LIMIT_NO_PAYMENTS;
+
+// Komunikat po wyczerpaniu darmowego limitu, gdy nie ma czego kupic.
+const FREE_LIMIT_MSG = {
+  pl: n => `Wykorzystano dzisiejszy limit darmowych zapytan (${n}). Odnowi sie jutro.`,
+  en: n => `Today's free query limit is used up (${n}). It resets tomorrow.`,
+  de: n => `Das heutige Limit kostenloser Anfragen ist erreicht (${n}). Es wird morgen zurueckgesetzt.`,
+};
 // Limity przestawialne zmiennymi srodowiskowymi — zmiana progu nie wymaga
 // deploya. Wartosci domyslne celowo takie jak dotad: obnizenie limitu to
 // zmiana warunkow dla kogos, kto juz zaplacil, i jest decyzja biznesowa,
@@ -82,7 +105,7 @@ const WELCOME_BONUS = 5;
 // a nie limit produktu: 200 to ponad czterdziestokrotnosc realnego uzycia.
 // PRO_LIMIT=0 w srodowisku przywraca dawne zachowanie bez sufitu.
 const PLAN_LIMITS = {
-  free: FREE_LIMIT,
+  free: FREE_DAILY,
   lite: Number(process.env.LITE_LIMIT) || 25,
   pro: (function () {
     const raw = process.env.PRO_LIMIT;
@@ -102,7 +125,7 @@ const PRO_FAIR_USE = {
   en: n => `Fair-use daily threshold reached (${n} queries). It resets tomorrow. Need more? Write to aurimiq@proton.me.`,
   de: n => `Faire-Nutzung-Grenze fuer heute erreicht (${n} Anfragen). Sie wird morgen zurueckgesetzt. Mehr noetig? Schreiben Sie an aurimiq@proton.me.`,
 };
-function planLimit(plan) { return PLAN_LIMITS[plan] ?? FREE_LIMIT; }
+function planLimit(plan) { return PLAN_LIMITS[plan] ?? FREE_DAILY; }
 function calcRemaining(plan, queries, totalEver) {
   if (plan === 'pro') return 999;
   if (plan === 'free' && totalEver < WELCOME_BONUS) return WELCOME_BONUS - totalEver;
@@ -145,6 +168,15 @@ async function checkPlan(req, res, next) {
       return next();
     }
     if (queries >= planLimit(req.plan)) {
+      if (!PAYMENTS_ENABLED) {
+        const l = FREE_LIMIT_MSG[req.body?.lang] ? req.body.lang : 'en';
+        return res.status(403).json({
+          error: FREE_LIMIT_MSG[l](planLimit(req.plan)),
+          upgrade: false,        // nie ma czego kupic
+          payments: false,
+          plan: req.plan
+        });
+      }
       return res.status(403).json({
         error: 'Daily limit reached',
         upgrade: true,
@@ -1751,7 +1783,7 @@ app.post('/api/chat', auth, checkPlan, async (req, res) => {
     const totalEver = req.totalEver || 0;
     const remaining = calcRemaining(req.plan, req.queries + 1, (req.totalEver || 0) + 1);
 
-    res.json({ reply, plan: req.plan, remaining, limit: req.plan === 'pro' ? 999 : planLimit(req.plan) });
+    res.json({ reply, plan: req.plan, remaining, limit: req.plan === 'pro' ? 999 : planLimit(req.plan), payments: PAYMENTS_ENABLED });
 
   } catch(e) {
     res.status(502).json({ error: 'AI error: ' + e.message });
@@ -2129,7 +2161,13 @@ app.get('/api/profile', auth, async (req, res) => {
   const plan = data?.plan || 'free';
   const totalEver = data?.total_queries_ever || 0;
   const remaining = calcRemaining(plan, queries, totalEver);
-  res.json({ plan, queries_today: queries, total_queries_ever: totalEver, limit: plan === 'pro' ? 999 : planLimit(plan), remaining });
+  res.json({ plan, queries_today: queries, total_queries_ever: totalEver, limit: plan === 'pro' ? 999 : planLimit(plan), remaining, payments: PAYMENTS_ENABLED });
+});
+
+// ── GET /api/config — publiczny, bez logowania ────────────────
+// Apka i terminal pytaja tu przy starcie, czy pokazywac przyciski zakupu.
+app.get('/api/config', (_, res) => {
+  res.json({ paymentsEnabled: PAYMENTS_ENABLED, freeDailyLimit: FREE_DAILY });
 });
 
 // ── DELETE /api/account — trwałe usunięcie konta i wszystkich danych ──
@@ -2215,6 +2253,9 @@ app.get('/api/history', auth, async (req, res) => {
 
 // ── Stripe checkout ───────────────────────────────────────────
 app.post('/api/create-checkout', auth, async (req, res) => {
+  if (!PAYMENTS_ENABLED) {
+    return res.status(403).json({ error: 'payments_disabled' });
+  }
   try {
     const { currency = 'pln', plan = 'pro', lang = 'pl' } = req.body;
     const STRIPE_LOCALE = { pl: 'pl', en: 'en', de: 'de' }[lang] || 'auto';
