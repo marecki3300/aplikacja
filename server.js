@@ -68,7 +68,7 @@ const WELCOME_BONUS = 5;
 // uzytkownik po 5 zapytaniach powitalnych nie moglby ani pytac, ani kupic.
 // Dlatego w tym trybie darmowe konto dostaje dzienny limit
 // FREE_LIMIT_NO_PAYMENTS (domyslnie 3).
-const PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED !== 'false';
+const PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED !== 'true';
 const FREE_LIMIT_NO_PAYMENTS = (function () {
   const n = Number(process.env.FREE_LIMIT_NO_PAYMENTS);
   return Number.isFinite(n) && n >= 0 && process.env.FREE_LIMIT_NO_PAYMENTS !== undefined && process.env.FREE_LIMIT_NO_PAYMENTS !== '' ? n : 3;
